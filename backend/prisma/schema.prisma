@@ -1,0 +1,329 @@
+// SettePay Marketplace — Prisma Schema
+// Database: PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── ENUMS ────────────────────────────────────────────────────────────────────
+
+enum UserKycTier {
+  TIER_0  // Phone only — EGP 200/day, 500/month
+  TIER_1  // Phone + National ID — EGP 1,000/day
+  TIER_2  // ID + selfie + address — EGP 10,000/day
+  TIER_3  // Full enhanced KYC — EGP 50,000/day
+}
+
+enum UserKycStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  UNDER_REVIEW
+}
+
+enum DealStatus {
+  PENDING                     // Deal created, waiting buyer payment initiation
+  AWAITING_BUYER_CONFIRMATION // sendPaymentRequest sent, buyer must confirm
+  AWAITING_TOP_UP             // Insufficient funds, buyer must top up
+  ESCROW_DEDUCTING            // deductFromUser in progress
+  ESCROW_ACTIVE               // Funds held, seller instructed to ship
+  SHIPPED                     // Seller marked as shipped, waybill active
+  DELIVERY_CONFIRMED          // Bosta/Sprint confirmed delivery
+  SETTLING                    // payToUser to seller in progress
+  SETTLED                     // Deal complete, funds released to seller
+  DISPUTED                    // Buyer raised dispute within 48h
+  REFUNDING                   // Auto-refund in progress
+  REFUNDED                    // Buyer refunded
+  PAYOUT_FAILED               // payToUser failed — ops intervention needed
+  PAYMENT_ERROR               // deductFromUser failed (error 6001)
+  CANCELLED                   // Deal auto-cancelled (timeout or explicit)
+}
+
+enum DisputeStatus {
+  OPEN
+  EVIDENCE_COLLECTION
+  UNDER_REVIEW
+  RESOLVED
+}
+
+enum DisputeResolution {
+  FULL_RELEASE  // Full amount (minus commission) to seller
+  PARTIAL       // Split between buyer and seller
+  FULL_REFUND   // Full amount to buyer
+}
+
+enum NotificationChannel {
+  MESSENGER
+  SMS
+  PUSH
+  EMAIL
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+}
+
+// ─── MODELS ───────────────────────────────────────────────────────────────────
+
+model User {
+  id              String        @id @default(uuid())
+  mobile          String        @unique
+  firstName       String
+  lastName        String
+  email           String?       @unique
+  passwordHash    String?
+  isProvider      Boolean       @default(false)  // true = Seller, false = Buyer
+
+  // HealthPay integration
+  hpUserToken     String?       // AES-256 encrypted HealthPay userToken
+  hpUid           String?       @unique           // HealthPay uid
+  hpTokenUpdatedAt DateTime?
+
+  // KYC
+  kycTier         UserKycTier   @default(TIER_0)
+  kycStatus       UserKycStatus @default(PENDING)
+  nationalId      String?       // AES-256 encrypted
+  kycVerifiedAt   DateTime?
+  kycProvider     String?       @default("valify")
+
+  // AML tracking
+  monthlyVolume   Float         @default(0)
+  monthlyVolumeResetAt DateTime @default(now())
+  isBlocked       Boolean       @default(false)
+  blockReason     String?
+
+  // Facebook / OAuth
+  facebookId      String?       @unique
+  facebookName    String?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  // Relations
+  dealsAsBuyer    Deal[]        @relation("BuyerDeals")
+  dealsAsSeller   Deal[]        @relation("SellerDeals")
+  disputesRaised  Dispute[]     @relation("DisputeRaisedBy")
+  notifications   NotificationEvent[]
+  auditLogs       AuditLog[]
+
+  @@index([mobile])
+  @@index([hpUid])
+  @@index([facebookId])
+}
+
+model Deal {
+  id              String      @id @default(uuid())
+  buyerId         String
+  sellerId        String
+  amount          Float       // Gross escrow amount in EGP
+  commission      Float?      // Calculated on settlement
+  netPayout       Float?      // amount - commission
+
+  status          DealStatus  @default(PENDING)
+
+  // Item details
+  itemDescription String
+  itemCategory    String?
+
+  // Messenger context
+  messengerThreadId String?   // Facebook Messenger thread ID
+  botMessageId    String?     // Message ID of the deal template
+
+  // Logistics
+  waybillId       String?     // Bosta/Sprint waybill ID
+  logisticsProvider String?   @default("bosta")
+  shippedAt       DateTime?
+  deliveredAt     DateTime?
+
+  // Timeline
+  escrowActivatedAt  DateTime?
+  buyerConfirmedAt   DateTime?
+  buyerConfirmDeadline DateTime? // 24h window for confirmation
+  disputeWindowEnd   DateTime?  // 48h after delivery
+  escrowExpiresAt    DateTime?  // 14 days after SHIPPED
+
+  // Idempotency
+  deductIdempotencyKey String? @unique
+  payoutIdempotencyKey String? @unique
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  settledAt       DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+
+  // Relations
+  buyer           User        @relation("BuyerDeals", fields: [buyerId], references: [id])
+  seller          User        @relation("SellerDeals", fields: [sellerId], references: [id])
+  escrowTx        EscrowTransaction?
+  dispute         Dispute?
+  commissionRecord CommissionRecord?
+  notifications   NotificationEvent[]
+  auditLogs       AuditLog[]
+
+  @@index([buyerId])
+  @@index([sellerId])
+  @@index([status])
+  @@index([waybillId])
+}
+
+model EscrowTransaction {
+  id              String    @id @default(uuid())
+  dealId          String    @unique
+  
+  // HealthPay references
+  hpDeductionRef  String?   // Description used in deductFromUser (includes dealId)
+  hpPayoutRef     String?   // Description used in payToUser (includes dealId)
+  hpPaymentReqId  String?   // ID from userPaymentRequests
+
+  // Amounts
+  amount          Float     // Gross escrow amount
+  commissionAmount Float?
+  netPayout       Float?
+
+  // Status tracking
+  deductedAt      DateTime?
+  deductSuccess   Boolean?
+  paidOutAt       DateTime?
+  payoutSuccess   Boolean?
+  payoutAttempts  Int       @default(0)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  deal            Deal      @relation(fields: [dealId], references: [id])
+
+  @@index([dealId])
+  @@index([hpDeductionRef])
+}
+
+model Dispute {
+  id              String          @id @default(uuid())
+  dealId          String          @unique
+  raisedById      String
+  
+  status          DisputeStatus   @default(OPEN)
+  resolution      DisputeResolution?
+  
+  // Amounts (for partial resolution)
+  sellerPayout    Float?
+  buyerRefund     Float?
+
+  // Evidence
+  buyerEvidence   String[]        // S3 URLs
+  sellerEvidence  String[]        // S3 URLs
+  adminNotes      String?
+
+  // Timeline
+  evidenceDeadline DateTime?      // 24h after raised
+  resolutionDeadline DateTime?    // 72h after raised
+  resolvedAt      DateTime?
+  resolvedById    String?         // Admin user ID
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  deal            Deal            @relation(fields: [dealId], references: [id])
+  raisedBy        User            @relation("DisputeRaisedBy", fields: [raisedById], references: [id])
+
+  @@index([dealId])
+  @@index([status])
+}
+
+model CommissionRecord {
+  id              String    @id @default(uuid())
+  dealId          String    @unique
+  
+  grossAmount     Float
+  commissionRate  Float
+  commissionAmount Float
+  netPayout       Float
+  
+  hpPayoutRef     String?
+
+  createdAt       DateTime  @default(now())
+
+  deal            Deal      @relation(fields: [dealId], references: [id])
+
+  @@index([dealId])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id              String    @id @default(uuid())
+  userId          String?
+  dealId          String?
+  
+  operation       String    // e.g., "authMerchant", "deductFromUser", "payToUser"
+  hpOperation     String?   // HealthPay GraphQL operation name
+  
+  // Sanitized request/response (tokens REDACTED)
+  requestSummary  Json?     // { operation, variables (sanitized) }
+  responseCode    String?   // "SUCCESS" or error code
+  responseSuccess Boolean?
+  
+  outcome         String?   // Human-readable outcome
+  errorMessage    String?
+
+  ipAddress       String?
+  userAgent       String?
+
+  createdAt       DateTime  @default(now())
+
+  user            User?     @relation(fields: [userId], references: [id])
+  deal            Deal?     @relation(fields: [dealId], references: [id])
+
+  @@index([userId])
+  @@index([dealId])
+  @@index([operation])
+  @@index([createdAt])
+}
+
+model NotificationEvent {
+  id              String              @id @default(uuid())
+  userId          String
+  dealId          String?
+  
+  channel         NotificationChannel
+  type            String              // e.g., "deal_confirmed", "escrow_active", "delivered"
+  status          NotificationStatus  @default(QUEUED)
+  
+  payload         Json?               // Message content
+  externalId      String?             // Messenger message ID / SMS reference
+  
+  error           String?
+  sentAt          DateTime?
+  deliveredAt     DateTime?
+
+  createdAt       DateTime            @default(now())
+
+  user            User                @relation(fields: [userId], references: [id])
+  deal            Deal?               @relation(fields: [dealId], references: [id])
+
+  @@index([userId])
+  @@index([dealId])
+  @@index([status])
+}
+
+model MerchantToken {
+  id              String    @id @default("singleton")
+  token           String    // Current HealthPay merchant JWT
+  expiresAt       DateTime
+  refreshedAt     DateTime  @default(now())
+}
+
+model OtpThrottle {
+  mobile          String    @id
+  attempts        Int       @default(0)
+  blockedUntil    DateTime?
+  lastAttemptAt   DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}

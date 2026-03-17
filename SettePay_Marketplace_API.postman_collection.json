@@ -1,0 +1,381 @@
+{
+  "info": {
+    "_postman_id": "settepay-marketplace-api",
+    "name": "SettePay Marketplace API",
+    "description": "SettePay Marketplace — Facebook Commerce Escrow Payment Layer\nPhase 1: HealthPay Integration\n\nDocs: SETT-MKT-BRD-001 / SETT-MKT-SRS-001\n\nSetup:\n1. Set {{baseUrl}} to http://localhost:3001/api/v1\n2. Run 'Auth / Send OTP' then 'Auth / Verify OTP' to get a token\n3. Token is auto-saved to {{token}} and {{userId}} collection variables",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl",   "value": "http://localhost:3001/api/v1", "type": "string" },
+    { "key": "token",     "value": "", "type": "string" },
+    { "key": "userId",    "value": "", "type": "string" },
+    { "key": "dealId",    "value": "", "type": "string" },
+    { "key": "disputeId", "value": "", "type": "string" },
+    { "key": "mobile",    "value": "+201000000001", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Liveness",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/../health/live",
+            "description": "Kubernetes liveness probe"
+          }
+        },
+        {
+          "name": "Readiness",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/../health/ready",
+            "description": "Checks DB + HealthPay token"
+          }
+        },
+        {
+          "name": "Status",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/../health/status",
+            "description": "Operational metrics"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Send OTP",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/auth/send-otp",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"{{mobile}}\",\n  \"firstName\": \"Ahmed\",\n  \"lastName\": \"Mohamed\"\n}"
+            }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('Status 200', () => pm.response.to.have.status(200));",
+            "pm.test('success true', () => pm.expect(pm.response.json().success).to.be.true);"
+          ]}}]
+        },
+        {
+          "name": "Verify OTP (Seller)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/auth/verify-otp",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mobile\": \"{{mobile}}\",\n  \"otp\": \"1234\",\n  \"isProvider\": true,\n  \"firstName\": \"Ahmed\",\n  \"lastName\": \"Mohamed\"\n}"
+            }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('Status 200', () => pm.response.to.have.status(200));",
+            "const data = pm.response.json();",
+            "pm.collectionVariables.set('token', data.token);",
+            "pm.collectionVariables.set('userId', data.user.id);",
+            "pm.test('Token received', () => pm.expect(data.token).to.be.a('string'));"
+          ]}}]
+        },
+        {
+          "name": "Get Current User",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/auth/me",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/auth/logout",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Wallet",
+      "item": [
+        {
+          "name": "Get Balance",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/deals/wallet/balance",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('Status 200', () => pm.response.to.have.status(200));",
+            "pm.test('Has total', () => pm.expect(pm.response.json().total).to.be.a('number'));"
+          ]}}]
+        },
+        {
+          "name": "Get Top-Up iFrameUrl",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/deals/wallet/topup",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"amount\": 500 }" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('Status 200', () => pm.response.to.have.status(200));",
+            "pm.test('Has iframeUrl', () => pm.expect(pm.response.json().iframeUrl).to.match(/^https/));"
+          ]}}]
+        }
+      ]
+    },
+    {
+      "name": "Deals",
+      "item": [
+        {
+          "name": "Create Deal",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/deals",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"buyerId\": \"REPLACE_WITH_BUYER_ID\",\n  \"amount\": 500,\n  \"itemDescription\": \"iPhone 14 Pro 256GB\"\n}"
+            }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('Status 201', () => pm.response.to.have.status(201));",
+            "const data = pm.response.json();",
+            "pm.collectionVariables.set('dealId', data.id);",
+            "pm.test('Status PENDING', () => pm.expect(data.status).to.equal('PENDING'));"
+          ]}}]
+        },
+        {
+          "name": "List My Deals (Seller)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/deals?role=seller", "query": [{ "key": "role", "value": "seller" }] },
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "List My Deals (Buyer)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/deals?role=buyer", "query": [{ "key": "role", "value": "buyer" }] },
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "Get Deal Detail",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/deals/{{dealId}}",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "Request Payment (Seller → Buyer)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/deals/{{dealId}}/request-payment",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "pm.test('Status 200', () => pm.response.to.have.status(200));",
+            "pm.test('isSuccess true', () => pm.expect(pm.response.json().isSuccess).to.be.true);"
+          ]}}]
+        },
+        {
+          "name": "Confirm Payment (Buyer — Triggers Escrow Deduction)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/deals/{{dealId}}/confirm-payment",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "Mark as Shipped (Seller)",
+          "request": {
+            "method": "PATCH",
+            "url": "{{baseUrl}}/deals/{{dealId}}/ship",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"waybillId\": \"BOSTA-TEST-001\" }" }
+          }
+        },
+        {
+          "name": "Get Payment Requests (Audit)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/deals/{{dealId}}/payment-requests",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Disputes",
+      "item": [
+        {
+          "name": "Raise Dispute (Buyer)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/disputes",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"dealId\": \"{{dealId}}\" }" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const data = pm.response.json();",
+            "if (pm.response.code === 201) pm.collectionVariables.set('disputeId', data.id);"
+          ]}}]
+        },
+        {
+          "name": "Get Dispute",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/disputes/{{disputeId}}",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "Submit Evidence",
+          "request": {
+            "method": "PATCH",
+            "url": "{{baseUrl}}/disputes/{{disputeId}}/evidence",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"evidenceUrls\": [\"https://example.com/photo.jpg\"] }" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "KYC",
+      "item": [
+        {
+          "name": "Verify Identity",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/kyc/verify",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"nationalId\": \"29901010100000\",\n  \"selfieUrl\": \"https://example.com/selfie.jpg\"\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin",
+      "item": [
+        {
+          "name": "Dashboard Stats",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/admin/deals/stats",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "All Disputes",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/admin/disputes",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "Resolve Dispute — Full Release",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/admin/disputes/{{disputeId}}/resolve",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"resolution\": \"FULL_RELEASE\",\n  \"adminNotes\": \"Evidence reviewed — seller provided tracking and delivery proof\"\n}" }
+          }
+        },
+        {
+          "name": "Resolve Dispute — Full Refund",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/admin/disputes/{{disputeId}}/resolve",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"resolution\": \"FULL_REFUND\",\n  \"adminNotes\": \"Item not as described — full refund authorised\"\n}" }
+          }
+        },
+        {
+          "name": "Resolve Dispute — Partial",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/admin/disputes/{{disputeId}}/resolve",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"resolution\": \"PARTIAL\",\n  \"sellerPayout\": 300,\n  \"buyerRefund\": 200,\n  \"adminNotes\": \"Partial fault on both sides\"\n}" }
+          }
+        },
+        {
+          "name": "All Deals",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/admin/deals",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "All Users",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/admin/users",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        },
+        {
+          "name": "Audit Log",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/admin/audit",
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Webhooks (Test)",
+      "item": [
+        {
+          "name": "Simulate Bosta Delivery",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/../api/v1/webhooks/delivery/bosta",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"waybillId\": \"BOSTA-TEST-001\",\n  \"state\": \"DELIVERED\",\n  \"stateCode\": \"45\",\n  \"timestamp\": \"2025-01-01T12:00:00Z\"\n}"
+            },
+            "description": "Simulate a Bosta delivery confirmation — triggers escrow release"
+          }
+        },
+        {
+          "name": "Simulate HealthPay Top-Up Webhook",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/../api/v1/webhooks/healthpay?event=topup_complete&userUid=REPLACE_HP_UID&amount=500&status=paid",
+              "query": [
+                { "key": "event",   "value": "topup_complete" },
+                { "key": "userUid", "value": "REPLACE_HP_UID" },
+                { "key": "amount",  "value": "500" },
+                { "key": "status",  "value": "paid" }
+              ]
+            },
+            "description": "Simulates HealthPay top-up confirmation webhook"
+          }
+        }
+      ]
+    }
+  ]
+}
