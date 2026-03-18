@@ -1,7 +1,8 @@
 import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
+import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { PrismaModule } from './common/prisma.module';
+import { RedisModule } from './common/redis.module';
 import { PaymentModule } from './payment/payment.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
@@ -24,6 +25,7 @@ import configuration from './config/configuration';
     ConfigModule.forRoot({ isGlobal: true, load: [configuration] }),
     ScheduleModule.forRoot(),
     PrismaModule,
+    RedisModule,        // Global Redis provider
     PaymentModule,
     AuthModule,
     UsersModule,

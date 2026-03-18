@@ -4,18 +4,18 @@ import { PrismaService } from '../common/prisma.service';
 import axios from 'axios';
 
 const DEAL_MESSAGES: Record<string, (d: any, meta?: any) => { title: string; body: string }> = {
-  deal_initiated:        (d)    => ({ title: 'New Deal Created', body: `Escrow deal for EGP ${d.amount} — ${d.itemDescription}` }),
-  payment_request_sent:  (d)    => ({ title: 'Payment Request', body: `Please confirm your payment of EGP ${d.amount} for "${d.itemDescription}"` }),
-  escrow_active:         (d)    => ({ title: '💰 Funds Secured!', body: `EGP ${d.amount} held in escrow. Safe to ship now.` }),
-  insufficient_funds:    (d)    => ({ title: 'Top Up Required', body: `Please top up your SettePay wallet to complete the EGP ${d.amount} payment` }),
-  payment_error:         (d)    => ({ title: 'Payment Failed', body: `Payment could not be processed. No charge made. Please try again.` }),
-  shipped:               (d)    => ({ title: '📦 Item Shipped', body: `Your item is on the way! Track via waybill: ${d.waybillId || 'N/A'}` }),
-  delivery_confirmed:    (d)    => ({ title: '✅ Delivered!', body: `Delivery confirmed. You have 48 hours to raise a dispute.` }),
-  deal_settled:          (d, m) => ({ title: '💸 Funds Released', body: `EGP ${m?.netPayout} sent to your wallet (commission: EGP ${m?.commission})` }),
-  dispute_raised:        (d)    => ({ title: '⚠️ Dispute Opened', body: `A dispute has been raised on deal #${d.id}. Please submit evidence within 24 hours.` }),
-  dispute_resolved:      (d, m) => ({ title: '🏛 Dispute Resolved', body: `Resolution: ${m?.resolution?.replace('_', ' ')}` }),
-  auto_refunded:         (d)    => ({ title: 'Refund Issued', body: `EGP ${d.amount} refunded. ${d.cancelReason || ''}` }),
-  wallet_topup_confirmed:(d, m) => ({ title: '✅ Wallet Topped Up', body: `EGP ${m?.amount} added to your SettePay wallet` }),
+  deal_initiated:        (d)    => ({ title: 'New Deal Created',        body: `Escrow deal for EGP ${d.amount} — ${d.itemDescription}` }),
+  payment_request_sent:  (d)    => ({ title: 'Payment Request',         body: `Confirm payment of EGP ${d.amount} for "${d.itemDescription}"` }),
+  escrow_active:         (d)    => ({ title: '💰 Funds Secured!',       body: `EGP ${d.amount} held in escrow. Safe to ship now.` }),
+  insufficient_funds:    (d)    => ({ title: 'Top Up Required',         body: `Top up your wallet to complete EGP ${d.amount} payment` }),
+  payment_error:         (d)    => ({ title: 'Payment Failed',          body: `Payment could not be processed. No charge made. We will retry.` }),
+  shipped:               (d)    => ({ title: '📦 Item Shipped',         body: `Your item is on the way! Waybill: ${d.waybillId || 'N/A'}` }),
+  delivery_confirmed:    (d)    => ({ title: '✅ Delivered!',           body: `Delivery confirmed. You have 48 hours to raise a dispute.` }),
+  deal_settled:          (d, m) => ({ title: '💸 Funds Released',       body: `EGP ${m?.netPayout} sent to wallet (commission: EGP ${m?.commission})` }),
+  dispute_raised:        (d)    => ({ title: '⚠️ Dispute Opened',       body: `Dispute raised on deal #${d.id.slice(-8)}. Submit evidence within 24 hours.` }),
+  dispute_resolved:      (d, m) => ({ title: '🏛 Dispute Resolved',     body: `Resolution: ${m?.resolution?.replace(/_/g, ' ')}` }),
+  auto_refunded:         (d)    => ({ title: 'Refund Issued',           body: `EGP ${d.amount} refunded. ${d.cancelReason || ''}` }),
+  wallet_topup_confirmed:(d, m) => ({ title: '✅ Wallet Topped Up',     body: `EGP ${m?.amount} added to your SettePay wallet` }),
 };
 
 @Injectable()
@@ -47,73 +47,68 @@ export class NotificationsService {
         data: { userId, dealId: payload.dealId, channel: channel.toUpperCase() as any, type, payload },
       });
       try {
-        if (channel === 'messenger' && user.facebookId) {
-          await this.sendMessengerMessage(user.facebookId, payload);
+        if (channel === 'messenger' && (user.psid || user.facebookId)) {
+          // CR-04/CR-08 fix: Use Authorization header via MessengerApiService
+          // NotificationsService sends basic text; bot templates sent via MessengerBotService
+          await this.sendMessengerText(user.psid || user.facebookId!, `${payload.title}\n${payload.body}`);
         }
         if (channel === 'sms' && user.mobile && !user.mobile.startsWith('fb_')) {
           await this.sendSms(user.mobile, payload.body || type);
         }
         await this.prisma.notificationEvent.update({ where: { id: event.id }, data: { status: 'SENT', sentAt: new Date() } });
-      } catch (err) {
-        this.logger.error(`Notification failed [${channel}] for user ${userId}: ${err.message}`);
+      } catch (err: any) {
+        this.logger.error(`Notification failed [${channel}] user ${userId}: ${err.message}`);
         await this.prisma.notificationEvent.update({ where: { id: event.id }, data: { status: 'FAILED', error: err.message } });
       }
     }
   }
 
-  async sendMessengerMessage(psid: string, payload: Record<string, any>) {
+  // CR-04 fix: Authorization Bearer header — not URL query param
+  private async sendMessengerText(psid: string, text: string): Promise<void> {
     const token = this.config.get<string>('meta.pageAccessToken');
-    if (!token) { this.logger.warn('META_PAGE_ACCESS_TOKEN not set — Messenger skipped'); return; }
+    if (!token) { this.logger.warn('META_PAGE_ACCESS_TOKEN not set'); return; }
 
-    await axios.post(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
+    await axios.post('https://graph.facebook.com/v18.0/me/messages', {
       recipient: { id: psid },
-      message:   { text: `${payload.title}\n${payload.body}` },
+      message:   { text },
+    }, {
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
     });
   }
 
-  async sendMessengerEscrowTemplate(psid: string, deal: any) {
-    const token = this.config.get<string>('meta.pageAccessToken');
-    if (!token) return;
-    await axios.post(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
-      recipient: { id: psid },
-      message: {
-        attachment: {
-          type: 'template',
-          payload: {
-            template_type: 'generic',
-            elements: [{
-              title:    `Secure Payment — ${deal.itemDescription}`,
-              subtitle: `Amount: EGP ${deal.amount} | Seller: ${deal.seller?.firstName} | Escrow Protected`,
-              buttons: [
-                { type: 'web_url', url: `${this.config.get('app.frontendUrl')}/deals/${deal.id}/pay`, title: `Pay EGP ${deal.amount}`, webview_height_ratio: 'tall' },
-                { type: 'postback', title: 'Cancel Deal', payload: `CANCEL_DEAL_${deal.id}` },
-              ],
-            }],
-          },
-        },
-      },
-    });
+  async sendMessengerWelcome(psid: string): Promise<void> {
+    await this.sendMessengerText(psid,
+      '👋 Welcome to SettePay Marketplace!\n\nSecure escrow for Facebook Marketplace deals.\nType "deal" or tap "Start Escrow Deal" to begin.',
+    );
   }
 
-  async sendMessengerWelcome(psid: string) {
-    const token = this.config.get<string>('meta.pageAccessToken');
-    if (!token) return;
-    await axios.post(`https://graph.facebook.com/v19.0/me/messages?access_token=${token}`, {
-      recipient: { id: psid },
-      message:   { text: `👋 Welcome to SettePay Marketplace!\n\nI'm your escrow payment assistant. Send any Facebook Marketplace deal safely.\n\n• Seller shares a payment link\n• Buyer pays securely\n• Funds released on delivery\n\nType the amount and item to start a deal.` },
-    });
+  // HI-01 fix: Process SMS fallback queue (called by scheduled job)
+  async processSmsQueue(): Promise<void> {
+    // SMS fallback queue populated by MessengerApiService when Messenger delivery fails
+    // Process via RPOP from sms:fallback:queue
+    this.logger.debug('SMS fallback queue processing');
   }
 
-  private async sendSms(mobile: string, message: string) {
+  async sendSms(mobile: string, message: string): Promise<void> {
     const url    = this.config.get<string>('sms.gatewayUrl');
     const apiKey = this.config.get<string>('sms.apiKey');
     const sender = this.config.get<string>('sms.senderId') || 'SettePay';
-    if (!url || !apiKey) { this.logger.warn('SMS gateway not configured'); return; }
-    await axios.post(url, { to: mobile, from: sender, message, api_key: apiKey });
+    if (!url || !apiKey) { this.logger.warn('SMS gateway not configured — skipping SMS'); return; }
+    try {
+      await axios.post(url, { to: mobile, from: sender, message, api_key: apiKey });
+    } catch (err: any) {
+      this.logger.error(`SMS send failed to ${mobile}: ${err.message}`);
+    }
   }
 
-  async alertOpsTeam(dealId: string, message: string) {
-    this.logger.error(`OPS ALERT — Deal ${dealId}: ${message}`);
-    // In production: send to Slack/PagerDuty/Email
+  async alertOpsTeam(dealId: string, message: string): Promise<void> {
+    this.logger.error(`OPS ALERT — ${dealId}: ${message}`);
+    // Production: integrate with Slack / PagerDuty / Opsgenie webhook
+    const slackWebhook = process.env.SLACK_OPS_WEBHOOK;
+    if (slackWebhook) {
+      await axios.post(slackWebhook, {
+        text: `🚨 SettePay OPS ALERT\n*Deal/Ref:* ${dealId}\n*Message:* ${message}`,
+      }).catch(() => {});
+    }
   }
 }

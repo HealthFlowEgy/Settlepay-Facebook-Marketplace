@@ -24,22 +24,19 @@ export class AuthService {
     @Inject(PAYMENT_SERVICE) private readonly payment: IPaymentService,
   ) {}
 
-  // ── Step 1: Send OTP ────────────────────────────────────────────────────────
   async sendOtp(mobile: string, firstName: string, lastName: string, email?: string) {
-    // Check OTP throttle
     const throttle = await this.prisma.otpThrottle.findUnique({ where: { mobile } });
     if (throttle?.blockedUntil && throttle.blockedUntil > new Date()) {
       const minutesLeft = Math.ceil((throttle.blockedUntil.getTime() - Date.now()) / 60000);
-      throw new BadRequestException(`OTP blocked for ${minutesLeft} more minutes. Try again later.`);
+      throw new BadRequestException(`OTP blocked for ${minutesLeft} more minutes.`);
     }
 
     try {
       const result = await this.payment.loginUser(mobile, firstName, lastName, email);
       await this.audit.log({ operation: 'loginUser', requestSummary: { mobile }, responseSuccess: true });
       return { success: true, uid: result.uid };
-    } catch (err) {
+    } catch (err: any) {
       if (err instanceof OtpThrottleError) {
-        // Set 60-minute block
         await this.prisma.otpThrottle.upsert({
           where:  { mobile },
           create: { mobile, attempts: 1, blockedUntil: new Date(Date.now() + 60 * 60 * 1000) },
@@ -52,71 +49,83 @@ export class AuthService {
     }
   }
 
-  // ── Step 2: Verify OTP + Register/Login ─────────────────────────────────────
-  async verifyOtpAndAuth(
-    mobile: string,
-    otp: string,
-    isProvider: boolean,
-    firstName?: string,
-    lastName?: string,
-  ) {
+  async verifyOtpAndAuth(mobile: string, otp: string, isProvider: boolean, firstName?: string, lastName?: string) {
     try {
-      // Authenticate on HealthPay
-      const hpResult = await this.payment.authUser(mobile, otp, isProvider);
+      const hpResult      = await this.payment.authUser(mobile, otp, isProvider);
       const encryptedToken = encryptToken(hpResult.userToken);
 
-      // Upsert user in SettePay DB
       const user = await this.prisma.user.upsert({
         where:  { mobile },
         create: {
-          mobile,
-          firstName: firstName || 'User',
-          lastName:  lastName  || '',
-          isProvider,
-          hpUserToken:     encryptedToken,
-          hpUid:           hpResult.uid,
-          hpTokenUpdatedAt: new Date(),
+          mobile, firstName: firstName || 'User', lastName: lastName || '',
+          isProvider, hpUserToken: encryptedToken, hpUid: hpResult.uid, hpTokenUpdatedAt: new Date(),
         },
-        update: {
-          hpUserToken:     encryptedToken,
-          hpUid:           hpResult.uid,
-          hpTokenUpdatedAt: new Date(),
-        },
+        update: { hpUserToken: encryptedToken, hpUid: hpResult.uid, hpTokenUpdatedAt: new Date() },
       });
 
-      // Clear OTP throttle
       await this.prisma.otpThrottle.deleteMany({ where: { mobile } }).catch(() => {});
-
-      // Generate SettePay JWT
       const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider });
-
       await this.audit.log({ userId: user.id, operation: 'authUser', responseSuccess: true });
       return { user, token };
-    } catch (err) {
-      if (err instanceof InvalidOtpError) {
-        throw new UnauthorizedException('Invalid OTP. Please try again.');
-      }
+    } catch (err: any) {
+      if (err instanceof InvalidOtpError) throw new UnauthorizedException('Invalid OTP. Please try again.');
       throw err;
     }
   }
 
-  // ── Facebook OAuth ──────────────────────────────────────────────────────────
+  /**
+   * HI-09 fix: Facebook OAuth users get a synthetic mobile for DB unique constraint.
+   * But we require them to verify a real mobile before initiating HealthPay operations.
+   */
   async facebookAuth(facebookId: string, name: string, email?: string) {
     let user = await this.prisma.user.findUnique({ where: { facebookId } });
+
     if (!user) {
       const [firstName, ...rest] = name.split(' ');
+      // HI-09 fix: Use `fb_` prefix mobile — intentionally synthetic, never used for HP calls
+      // SMS skipped for fb_ prefix (handled in NotificationsService)
       user = await this.prisma.user.create({
-        data: { facebookId, firstName, lastName: rest.join(' '), email, mobile: `fb_${facebookId}` },
+        data: {
+          facebookId,
+          firstName,
+          lastName: rest.join(' '),
+          email,
+          mobile: `fb_${facebookId}`,   // synthetic — marks as Facebook-only account
+          // hpUserToken is NULL — user cannot initiate HP transactions until mobile is verified
+          kycTier: 'TIER_0',
+        },
       });
     }
+
     const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider });
-    return { user, token };
+    return {
+      user,
+      token,
+      // HI-09: Signal to frontend that mobile verification is required for payments
+      requiresMobileVerification: !user.hpUserToken,
+    };
   }
 
-  // ── Logout ──────────────────────────────────────────────────────────────────
+  /**
+   * HI-09 fix: Link real mobile to Facebook account (required before HealthPay operations)
+   */
+  async linkMobileToFacebookAccount(userId: string, mobile: string, firstName: string, lastName: string) {
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    if (!user.facebookId) throw new BadRequestException('This account is not a Facebook OAuth account');
+
+    // Check mobile not already taken
+    const existing = await this.prisma.user.findUnique({ where: { mobile } });
+    if (existing && existing.id !== userId) throw new ConflictException('This mobile number is already registered');
+
+    // Send OTP to real mobile
+    await this.payment.loginUser(mobile, user.firstName, user.lastName);
+    await this.prisma.user.update({ where: { id: userId }, data: { mobile } });
+    return { success: true, message: 'OTP sent to mobile. Please verify.' };
+  }
+
   async logout(userId: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
-    if (user.hpUserToken) {
+    if (user.hpUserToken && !user.mobile.startsWith('fb_')) {
       const { decryptToken } = await import('../common/crypto.util');
       const hpToken = decryptToken(user.hpUserToken);
       await this.payment.logoutUser(hpToken).catch(() => {});

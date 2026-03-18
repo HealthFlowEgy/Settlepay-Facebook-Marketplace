@@ -1,128 +1,93 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
+import { REDIS_CLIENT } from '../common/redis.module';
 import { BotSession, BotSessionState } from './bot-session.types';
+import Redis from 'ioredis';
+import { generateSecureToken } from '../common/crypto.util';
 
 /**
- * BotSessionService (A.5)
- *
- * Manages Redis-backed conversation state for each Messenger PSID.
- * In the current implementation, falls back to Prisma (BotSession table)
- * when Redis is unavailable. Production should use @InjectRedis().
- *
- * Redis Key Patterns (A.3):
- *   bot:session:{psid}      → BotSession JSON (30 min TTL)
- *   bot:psid_map:{psid}     → SettePay userId (30 days TTL)
- *   bot:link_token:{token}  → psid + userId (15 min TTL)
- *   bot:deal_draft:{psid}   → Partial deal data (24h TTL)
- *   bot:otp_psid:{mobile}   → psid awaiting OTP (10 min TTL)
- *   bot:notif_lock:{dealId} → Idempotent notification lock (30 sec TTL)
+ * BotSessionService (A.5 — Fixed: CR-02)
+ * Redis-backed conversation state. No in-memory Map.
  */
 @Injectable()
 export class BotSessionService {
   private readonly logger = new Logger(BotSessionService.name);
+  private readonly SESSION_TTL    = 1800;    // 30 min
+  private readonly PSID_MAP_TTL   = 2592000; // 30 days
+  private readonly LINK_TOKEN_TTL = 900;     // 15 min
+  private readonly NOTIF_LOCK_TTL = 30;      // 30 sec
 
-  // In-memory store as Redis fallback for development
-  // Production: replace with @InjectRedis() private redis: Redis
-  private sessionStore = new Map<string, string>();
-  private psidMap = new Map<string, string>();
-
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    private readonly prisma: PrismaService,
+  ) {}
 
   async getSession(psid: string): Promise<BotSession> {
-    // Try in-memory/Redis first
-    const raw = this.sessionStore.get(`bot:session:${psid}`);
+    const raw = await this.redis.get(`bot:session:${psid}`);
     if (raw) {
-      try {
-        return JSON.parse(raw);
-      } catch {
-        // Corrupted session, reset
-      }
+      try { return JSON.parse(raw); } catch { /* corrupted — reset */ }
     }
-
-    // Fallback to DB
-    const dbSession = await this.prisma.botSession.findUnique({
-      where: { psid },
-    });
-
-    if (dbSession) {
+    const db = await this.prisma.botSession.findUnique({ where: { psid } });
+    if (db) {
       return {
-        psid: dbSession.psid,
-        state: dbSession.state as BotSessionState,
-        context: (dbSession.context as Record<string, any>) || {},
-        dealId: dbSession.dealId || undefined,
-        userId: dbSession.userId || undefined,
+        psid: db.psid,
+        state: db.state as BotSessionState,
+        context: (db.context as Record<string, any>) || {},
+        dealId: db.dealId ?? undefined,
+        userId: db.userId ?? undefined,
       };
     }
-
     return { psid, state: BotSessionState.IDLE, context: {} };
   }
 
-  async updateSession(
-    psid: string,
-    patch: Partial<BotSession>,
-  ): Promise<void> {
+  async updateSession(psid: string, patch: Partial<BotSession>): Promise<void> {
     const current = await this.getSession(psid);
-    const updated: BotSession = {
-      ...current,
-      ...patch,
-      updatedAt: new Date().toISOString(),
-    };
-
-    // Store in memory/Redis (30 min TTL)
-    this.sessionStore.set(
-      `bot:session:${psid}`,
-      JSON.stringify(updated),
-    );
-
-    // Persist to DB
-    await this.prisma.botSession.upsert({
-      where: { psid },
-      update: {
-        state: updated.state,
-        context: updated.context,
-        dealId: updated.dealId || null,
-        userId: updated.userId || null,
-      },
-      create: {
-        psid,
-        state: updated.state,
-        context: updated.context,
-        dealId: updated.dealId || null,
-        userId: updated.userId || null,
-      },
-    });
+    const updated: BotSession = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    await this.redis.setex(`bot:session:${psid}`, this.SESSION_TTL, JSON.stringify(updated));
+    // Persist async for durability
+    this.prisma.botSession.upsert({
+      where:  { psid },
+      update: { state: updated.state, context: updated.context, dealId: updated.dealId ?? null, userId: updated.userId ?? null },
+      create: { psid, state: updated.state, context: updated.context, dealId: updated.dealId ?? null, userId: updated.userId ?? null },
+    }).catch(e => this.logger.warn(`BotSession DB upsert (non-critical): ${e.message}`));
   }
 
   async clearSession(psid: string): Promise<void> {
-    this.sessionStore.delete(`bot:session:${psid}`);
-    await this.prisma.botSession.deleteMany({ where: { psid } });
+    await this.redis.del(`bot:session:${psid}`);
+    await this.prisma.botSession.deleteMany({ where: { psid } }).catch(() => {});
   }
 
   async linkPsidToUser(psid: string, userId: string): Promise<void> {
-    // Cache PSID → userId mapping (30 days in Redis)
-    this.psidMap.set(`bot:psid_map:${psid}`, userId);
-
-    // Update User record with PSID
+    await this.redis.setex(`bot:psid_map:${psid}`, this.PSID_MAP_TTL, userId);
     await this.prisma.user.update({
       where: { id: userId },
-      data: {
-        psid,
-        messengerLinked: true,
-        messengerLinkedAt: new Date(),
-      },
+      data: { psid, messengerLinked: true, messengerLinkedAt: new Date() },
     });
-
-    this.logger.log(`Linked PSID ${psid} to user ${userId}`);
+    this.logger.log(`Linked PSID ${psid} → user ${userId}`);
   }
 
   async getUserByPsid(psid: string): Promise<any | null> {
-    // Try cache first
-    const cachedUserId = this.psidMap.get(`bot:psid_map:${psid}`);
-    if (cachedUserId) {
-      return this.prisma.user.findUnique({ where: { id: cachedUserId } });
-    }
-
-    // Fallback to DB lookup by PSID
+    const userId = await this.redis.get(`bot:psid_map:${psid}`);
+    if (userId) return this.prisma.user.findUnique({ where: { id: userId } });
     return this.prisma.user.findUnique({ where: { psid } });
+  }
+
+  /** CR-03 fix: CSPRNG token for account linking (15-min TTL, single-use) */
+  async createLinkToken(psid: string): Promise<string> {
+    const token = generateSecureToken();
+    await this.redis.setex(`bot:link_token:${token}`, this.LINK_TOKEN_TTL, psid);
+    return token;
+  }
+
+  async resolveLinkToken(token: string): Promise<string | null> {
+    const psid = await this.redis.get(`bot:link_token:${token}`);
+    if (psid) await this.redis.del(`bot:link_token:${token}`); // single-use
+    return psid;
+  }
+
+  /** Idempotency lock for notifications — prevents duplicate Messenger sends */
+  async acquireNotifLock(dealId: string, type: string): Promise<boolean> {
+    const result = await this.redis.set(`bot:notif_lock:${dealId}:${type}`, '1', 'EX', this.NOTIF_LOCK_TTL, 'NX');
+    return result === 'OK';
   }
 }

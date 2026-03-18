@@ -1,5 +1,9 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../common/prisma.module';
+import { RedisModule } from '../common/redis.module';
+import { PaymentModule } from '../payment/payment.module';
+import { CommissionModule } from '../commission/commission.module';
+import { AuditModule } from '../audit/audit.module';
 import { MessengerBotService } from './messenger-bot.service';
 import { MessengerApiService } from './messenger-api.service';
 import { BotSessionService } from './bot-session.service';
@@ -10,19 +14,8 @@ import { TextHandler } from './handlers/text.handler';
 import { QuickReplyHandler } from './handlers/quick-reply.handler';
 import { OptinHandler } from './handlers/optin.handler';
 
-/**
- * MessengerModule (A.1)
- *
- * Wires all Messenger bot components together:
- *   - MessengerBotService: Central dispatcher
- *   - MessengerApiService: Meta Graph API wrapper
- *   - BotSessionService: Redis-backed conversation state
- *   - TemplateFactory: All 8 Generic Template builders
- *   - QuickReplyFactory: Quick reply option builders
- *   - Handlers: Postback, Text, QuickReply, Optin
- */
 @Module({
-  imports: [PrismaModule],
+  imports: [PrismaModule, RedisModule, PaymentModule, CommissionModule, AuditModule],
   providers: [
     MessengerBotService,
     MessengerApiService,
@@ -34,6 +27,6 @@ import { OptinHandler } from './handlers/optin.handler';
     QuickReplyHandler,
     OptinHandler,
   ],
-  exports: [MessengerBotService, MessengerApiService, TemplateFactory],
+  exports: [MessengerBotService, MessengerApiService, BotSessionService, TemplateFactory],
 })
 export class MessengerModule {}
