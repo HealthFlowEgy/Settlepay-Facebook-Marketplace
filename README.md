@@ -66,12 +66,16 @@ npm run dev                # http://localhost:5173
 ### Test Credentials (Beta)
 | Key | Value |
 |---|---|
-| API Header | `H_0003rjeb7ke0dejn` |
-| API Key | `k_0003ijn47ke1x38o` |
+| API Header | `H_xxxx...` (from internal Postman collection / team 1Password) |
+| API Key | `k_xxxx...` (from internal Postman collection / team 1Password) |
 | Base URL | `https://sword.beta.healthpay.tech/graphql` |
 | Portal | `https://portal.beta.healthpay.tech` |
 
-> ⚠️ **Never commit production HealthPay credentials to version control.**
+> ⚠️ HealthPay integration credentials are distributed via the
+> internal Postman collection (HealthpayGraphql_postman_collection.json).
+> Contact the HealthFlow team for access.
+>
+> **Never commit production HealthPay credentials to version control.**
 > Use AWS Secrets Manager or equivalent in production.
 
 ### PaymentService Abstraction

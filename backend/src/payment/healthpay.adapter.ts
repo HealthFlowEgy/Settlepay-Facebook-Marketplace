@@ -4,8 +4,9 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../common/prisma.service';
 import {
   IPaymentService, WalletBalance, PaymentRequest,
-  RegisterUserResult, TopupResult,
+  RegisterUserResult, TopupResult, VirtualCard,
 } from './payment.service.interface';
+import { NotImplementedException } from '@nestjs/common';
 
 // ─── GraphQL Operations ───────────────────────────────────────────────────────
 const GQL = {
@@ -254,5 +255,28 @@ export class HealthPayAdapter implements IPaymentService, OnModuleInit {
   async getPaymentRequests(userToken: string): Promise<PaymentRequest[]> {
     const data = await this.executeGql(GQL.USER_PAYMENT_REQUESTS, { userToken });
     return data.userPaymentRequests;
+  }
+
+  // ── Phase 2 Method Stubs (F.1) ─────────────────────────────────────────────
+
+  async issueVirtualCard(userId: string): Promise<VirtualCard> {
+    throw new NotImplementedException(
+      'issueVirtualCard requires SettePay PSP-A license (Phase 2)',
+    );
+  }
+
+  async instantSettlement(
+    sellerToken: string,
+    amount: number,
+  ): Promise<{ isSuccess: boolean }> {
+    throw new NotImplementedException(
+      'instantSettlement requires SettePay PSP (Phase 2)',
+    );
+  }
+
+  async getTransactionFee(amount: number): Promise<number> {
+    throw new NotImplementedException(
+      'getTransactionFee requires SettePay PSP (Phase 2)',
+    );
   }
 }

@@ -104,6 +104,11 @@ model User {
   facebookId      String?       @unique
   facebookName    String?
 
+  // Messenger Bot (GAP-01 / A.2)
+  psid            String?       @unique  // Facebook Page-Scoped User ID
+  messengerLinked Boolean       @default(false)
+  messengerLinkedAt DateTime?
+
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
@@ -117,6 +122,7 @@ model User {
   @@index([mobile])
   @@index([hpUid])
   @@index([facebookId])
+  @@index([psid])
 }
 
 model Deal {
@@ -311,6 +317,20 @@ model NotificationEvent {
   @@index([userId])
   @@index([dealId])
   @@index([status])
+}
+
+// ─── Messenger Bot Session (GAP-01 / A.2) ─────────────────────────────────────
+
+model BotSession {
+  id        String   @id @default(cuid())
+  psid      String   @unique
+  state     String   @default("IDLE")  // BotSessionState enum
+  context   Json?                       // wizard in-progress data
+  dealId    String?                     // active deal being constructed
+  userId    String?                     // linked SettePay user
+  updatedAt DateTime @updatedAt
+
+  @@index([psid])
 }
 
 model MerchantToken {

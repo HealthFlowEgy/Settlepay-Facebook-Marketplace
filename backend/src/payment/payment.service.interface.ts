@@ -35,6 +35,14 @@ export interface TopupResult {
   iframeUrl: string;
 }
 
+export interface VirtualCard {
+  id: string;
+  cardNumber: string; // masked
+  expiryMonth: number;
+  expiryYear: number;
+  status: 'active' | 'frozen' | 'expired';
+}
+
 export interface IPaymentService {
   // ── Merchant Auth ────────────────────────────────────────────────────────
   /** Authenticate merchant — returns JWT token. Auto-called by token manager. */
@@ -79,4 +87,24 @@ export interface IPaymentService {
   // ── Transaction History ──────────────────────────────────────────────────
   /** Get all payment requests for a user — used for dispute audit trail. */
   getPaymentRequests(userToken: string): Promise<PaymentRequest[]>;
+
+  // ── Phase 2 Methods (F.1 — stub now, implement with SettePay PSP) ────────
+
+  /**
+   * Issue a virtual card for e-money issuance.
+   * Requires SettePay PSP-A license.
+   */
+  issueVirtualCard?(userId: string): Promise<VirtualCard>;
+
+  /**
+   * Instant settlement (T+0) via SettePay PSP.
+   * Bypasses standard settlement window.
+   */
+  instantSettlement?(sellerToken: string, amount: number): Promise<{ isSuccess: boolean }>;
+
+  /**
+   * Get dynamic transaction fee from PSP.
+   * May vary by amount, user tier, or time of day.
+   */
+  getTransactionFee?(amount: number): Promise<number>;
 }

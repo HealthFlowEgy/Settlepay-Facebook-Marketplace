@@ -14,6 +14,7 @@ import { KycModule } from './kyc/kyc.module';
 import { AuditModule } from './audit/audit.module';
 import { AmlModule } from './common/aml.module';
 import { LogisticsModule } from './common/logistics.module';
+import { MessengerModule } from './messenger/messenger.module';
 import { HealthController } from './health.controller';
 import { RequestLoggerMiddleware } from './common/request-logger.middleware';
 import configuration from './config/configuration';
@@ -35,6 +36,7 @@ import configuration from './config/configuration';
     AuditModule,
     AmlModule,
     LogisticsModule,
+    MessengerModule,
   ],
   controllers: [HealthController],
 })

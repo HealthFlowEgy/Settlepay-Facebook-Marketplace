@@ -20,7 +20,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   IPaymentService, WalletBalance, PaymentRequest,
-  RegisterUserResult, TopupResult,
+  RegisterUserResult, TopupResult, VirtualCard,
 } from './payment.service.interface';
 
 @Injectable()
@@ -92,5 +92,33 @@ export class SettepayPspAdapter implements IPaymentService {
   async getPaymentRequests(userToken: string): Promise<PaymentRequest[]> {
     // TODO: Query SettePay internal transaction ledger for this user
     throw new Error('SettepayPspAdapter.getPaymentRequests: not yet implemented — Phase 2');
+  }
+
+  // ── Phase 2 Methods (F.1) ─────────────────────────────────────────────────
+
+  async issueVirtualCard(userId: string): Promise<VirtualCard> {
+    // TODO: Issue virtual prepaid card via SettePay PSP-A license
+    // CBE PSP-A Art. 1-8: E-money issuance
+    // Returns masked card number, expiry, and status
+    throw new Error('SettepayPspAdapter.issueVirtualCard: not yet implemented — Phase 2');
+  }
+
+  async instantSettlement(
+    sellerToken: string,
+    amount: number,
+  ): Promise<{ isSuccess: boolean }> {
+    // TODO: Instant T+0 settlement via SettePay PSP
+    // Bypasses standard T+1/T+2 settlement window
+    // Requires real-time clearing with CBE
+    throw new Error('SettepayPspAdapter.instantSettlement: not yet implemented — Phase 2');
+  }
+
+  async getTransactionFee(amount: number): Promise<number> {
+    // TODO: Dynamic fee calculation based on:
+    // - Transaction amount
+    // - User tier (standard/premium)
+    // - Time of day (peak/off-peak)
+    // - CBE regulatory caps
+    throw new Error('SettepayPspAdapter.getTransactionFee: not yet implemented — Phase 2');
   }
 }
