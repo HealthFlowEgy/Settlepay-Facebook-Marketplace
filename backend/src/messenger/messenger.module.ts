@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { PrismaModule } from '../common/prisma.module';
 import { RedisModule } from '../common/redis.module';
 import { PaymentModule } from '../payment/payment.module';
@@ -14,8 +14,22 @@ import { TextHandler } from './handlers/text.handler';
 import { QuickReplyHandler } from './handlers/quick-reply.handler';
 import { OptinHandler } from './handlers/optin.handler';
 
+// forwardRef breaks circular: MessengerModule ↔ DealsModule ↔ NotificationsModule
+// DealsModule is imported here so PostbackHandler/TextHandler can access EscrowService/WalletService
+// DisputesModule is imported for DisputesService in PostbackHandler/QuickReplyHandler
+import { DealsModule } from '../deals/deals.module';
+import { DisputesModule } from '../disputes/disputes.module';
+
 @Module({
-  imports: [PrismaModule, RedisModule, PaymentModule, CommissionModule, AuditModule],
+  imports: [
+    PrismaModule,
+    RedisModule,
+    PaymentModule,
+    CommissionModule,
+    AuditModule,
+    forwardRef(() => DealsModule),      // break potential circular
+    forwardRef(() => DisputesModule),   // break potential circular
+  ],
   providers: [
     MessengerBotService,
     MessengerApiService,

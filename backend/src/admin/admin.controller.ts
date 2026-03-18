@@ -1,4 +1,7 @@
-import { Controller, Get, Post, Body, Param, Query, UseGuards, HttpCode } from '@nestjs/common';
+import {
+  Controller, Get, Post, Body, Param, Query,
+  UseGuards, HttpCode, ForbiddenException, Req,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt.guard';
 import { DisputesService } from '../disputes/disputes.service';
 import { PrismaService } from '../common/prisma.service';
@@ -12,92 +15,132 @@ class ResolveDto {
   @IsOptional() @IsNumber()  buyerRefund?: number;
 }
 
+/**
+ * AdminController — Fixed: added isAdmin role guard
+ * All admin endpoints require JWT + isAdmin flag on user record.
+ */
 @Controller('admin')
 @UseGuards(JwtAuthGuard)
-// TODO: add AdminGuard to restrict to admin role
 export class AdminController {
   constructor(
     private readonly disputes: DisputesService,
     private readonly prisma: PrismaService,
   ) {}
 
+  // ── Role guard helper — checks isAdmin on the User record ─────────────────
+  private async requireAdmin(userId: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user?.isAdmin) {
+      throw new ForbiddenException('Admin access required');
+    }
+  }
+
   // ── Disputes ──────────────────────────────────────────────────────────────
   @Get('disputes')
-  getAllDisputes(@Query('status') status?: string) {
+  async getAllDisputes(@Req() req: any, @Query('status') status?: string) {
+    await this.requireAdmin(req.user.sub);
     return this.disputes.getAllDisputes(status as any);
   }
 
   @Get('disputes/:id')
-  getDispute(@Param('id') id: string) {
+  async getDispute(@Req() req: any, @Param('id') id: string) {
+    await this.requireAdmin(req.user.sub);
     return this.disputes.getDispute(id);
   }
 
   @Post('disputes/:id/resolve')
   @HttpCode(200)
-  resolveDispute(@Param('id') id: string, @Body() dto: ResolveDto) {
-    // adminId would come from JWT in production
-    return this.disputes.resolveDispute(id, 'admin', dto.resolution, dto.adminNotes, dto.sellerPayout, dto.buyerRefund);
+  async resolveDispute(@Req() req: any, @Param('id') id: string, @Body() dto: ResolveDto) {
+    await this.requireAdmin(req.user.sub);
+    return this.disputes.resolveDispute(id, req.user.sub, dto.resolution, dto.adminNotes, dto.sellerPayout, dto.buyerRefund);
   }
 
-  // ── Deals Overview ────────────────────────────────────────────────────────
+  // ── Deals ─────────────────────────────────────────────────────────────────
   @Get('deals')
-  getDeals(@Query('status') status?: string, @Query('limit') limit = '50') {
+  async getDeals(@Req() req: any, @Query('status') status?: string, @Query('limit') limit = '50') {
+    await this.requireAdmin(req.user.sub);
     return this.prisma.deal.findMany({
       where:   status ? { status: status as DealStatus } : undefined,
       orderBy: { createdAt: 'desc' },
-      take:    parseInt(limit),
+      take:    parseInt(limit, 10),
       include: {
-        buyer:  { select: { id: true, firstName: true, lastName: true, mobile: true } },
-        seller: { select: { id: true, firstName: true, lastName: true, mobile: true } },
-        escrowTx: true, dispute: true,
+        buyer:    { select: { id: true, firstName: true, lastName: true, mobile: true } },
+        seller:   { select: { id: true, firstName: true, lastName: true, mobile: true } },
+        escrowTx: true, dispute: true, commissionRecord: true,
       },
     });
   }
 
   @Get('deals/stats')
-  async getStats() {
-    const [total, active, settled, disputed, paidout] = await Promise.all([
+  async getStats(@Req() req: any) {
+    await this.requireAdmin(req.user.sub);
+    const [total, active, settled, disputed, commissionTotal] = await Promise.all([
       this.prisma.deal.count(),
-      this.prisma.deal.count({ where: { status: DealStatus.ESCROW_ACTIVE } }),
-      this.prisma.deal.count({ where: { status: DealStatus.SETTLED } }),
-      this.prisma.deal.count({ where: { status: DealStatus.DISPUTED } }),
+      this.prisma.deal.count({ where: { status: { in: ['ESCROW_ACTIVE', 'SHIPPED', 'DELIVERY_CONFIRMED'] } } }),
+      this.prisma.deal.count({ where: { status: 'SETTLED' } }),
+      this.prisma.dispute.count({ where: { status: { in: ['OPEN', 'EVIDENCE_COLLECTION', 'UNDER_REVIEW'] } } }),
       this.prisma.commissionRecord.aggregate({ _sum: { commissionAmount: true } }),
     ]);
-    return { total, active, settled, disputed, totalCommission: paidout._sum.commissionAmount || 0 };
+    return {
+      totalDeals:       total,
+      activeEscrows:    active,
+      settledDeals:     settled,
+      openDisputes:     disputed,
+      totalCommission:  commissionTotal._sum.commissionAmount ?? 0,
+    };
   }
 
-  // ── Users ──────────────────────────────────────────────────────────────────
+  // ── Users ─────────────────────────────────────────────────────────────────
   @Get('users')
-  getUsers(@Query('limit') limit = '50', @Query('kycStatus') kycStatus?: string) {
+  async getUsers(@Req() req: any, @Query('kycTier') kycTier?: string, @Query('limit') limit = '50') {
+    await this.requireAdmin(req.user.sub);
     return this.prisma.user.findMany({
-      where:   kycStatus ? { kycStatus: kycStatus as any } : undefined,
+      where:   kycTier ? { kycTier: kycTier as any } : undefined,
+      take:    parseInt(limit, 10),
       orderBy: { createdAt: 'desc' },
-      take:    parseInt(limit),
       select: {
-        id: true, mobile: true, firstName: true, lastName: true,
-        isProvider: true, kycTier: true, kycStatus: true,
-        monthlyVolume: true, isBlocked: true, createdAt: true,
-        _count: { select: { dealsAsBuyer: true, dealsAsSeller: true } },
+        id: true, firstName: true, lastName: true, mobile: true,
+        email: true, isProvider: true, kycTier: true, kycStatus: true,
+        isBlocked: true, blockReason: true, monthlyVolume: true,
+        createdAt: true, facebookId: true, psid: true,
       },
     });
   }
 
   @Post('users/:id/block')
   @HttpCode(200)
-  blockUser(@Param('id') id: string, @Body('reason') reason: string) {
-    return this.prisma.user.update({
-      where: { id },
-      data:  { isBlocked: true, blockReason: reason },
-    });
+  async blockUser(@Req() req: any, @Param('id') id: string, @Body('reason') reason: string) {
+    await this.requireAdmin(req.user.sub);
+    await this.prisma.user.update({ where: { id }, data: { isBlocked: true, blockReason: reason || 'Blocked by admin' } });
+    return { success: true };
+  }
+
+  @Post('users/:id/unblock')
+  @HttpCode(200)
+  async unblockUser(@Req() req: any, @Param('id') id: string) {
+    await this.requireAdmin(req.user.sub);
+    await this.prisma.user.update({ where: { id }, data: { isBlocked: false, blockReason: null } });
+    return { success: true };
   }
 
   // ── Audit Logs ────────────────────────────────────────────────────────────
   @Get('audit')
-  getAuditLogs(@Query('userId') userId?: string, @Query('operation') operation?: string) {
+  async getAuditLogs(
+    @Req() req: any,
+    @Query('userId') userId?: string,
+    @Query('dealId') dealId?: string,
+    @Query('operation') operation?: string,
+    @Query('limit') limit = '100',
+  ) {
+    await this.requireAdmin(req.user.sub);
     return this.prisma.auditLog.findMany({
-      where:   { ...(userId && { userId }), ...(operation && { operation }) },
+      where: {
+        ...(userId    && { userId }),
+        ...(dealId    && { dealId }),
+        ...(operation && { operation }),
+      },
       orderBy: { createdAt: 'desc' },
-      take:    100,
+      take: parseInt(limit, 10),
     });
   }
 }

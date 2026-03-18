@@ -24,13 +24,13 @@ export class AuthService {
     @Inject(PAYMENT_SERVICE) private readonly payment: IPaymentService,
   ) {}
 
+  // ── Step 1: Send OTP ────────────────────────────────────────────────────────
   async sendOtp(mobile: string, firstName: string, lastName: string, email?: string) {
     const throttle = await this.prisma.otpThrottle.findUnique({ where: { mobile } });
     if (throttle?.blockedUntil && throttle.blockedUntil > new Date()) {
       const minutesLeft = Math.ceil((throttle.blockedUntil.getTime() - Date.now()) / 60000);
       throw new BadRequestException(`OTP blocked for ${minutesLeft} more minutes.`);
     }
-
     try {
       const result = await this.payment.loginUser(mobile, firstName, lastName, email);
       await this.audit.log({ operation: 'loginUser', requestSummary: { mobile }, responseSuccess: true });
@@ -49,9 +49,10 @@ export class AuthService {
     }
   }
 
+  // ── Step 2: Verify OTP ──────────────────────────────────────────────────────
   async verifyOtpAndAuth(mobile: string, otp: string, isProvider: boolean, firstName?: string, lastName?: string) {
     try {
-      const hpResult      = await this.payment.authUser(mobile, otp, isProvider);
+      const hpResult       = await this.payment.authUser(mobile, otp, isProvider);
       const encryptedToken = encryptToken(hpResult.userToken);
 
       const user = await this.prisma.user.upsert({
@@ -66,63 +67,83 @@ export class AuthService {
       await this.prisma.otpThrottle.deleteMany({ where: { mobile } }).catch(() => {});
       const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider });
       await this.audit.log({ userId: user.id, operation: 'authUser', responseSuccess: true });
-      return { user, token };
+      return { user: this.sanitizeUser(user), token };
     } catch (err: any) {
       if (err instanceof InvalidOtpError) throw new UnauthorizedException('Invalid OTP. Please try again.');
       throw err;
     }
   }
 
-  /**
-   * HI-09 fix: Facebook OAuth users get a synthetic mobile for DB unique constraint.
-   * But we require them to verify a real mobile before initiating HealthPay operations.
-   */
+  // ── Facebook OAuth ──────────────────────────────────────────────────────────
   async facebookAuth(facebookId: string, name: string, email?: string) {
     let user = await this.prisma.user.findUnique({ where: { facebookId } });
-
     if (!user) {
       const [firstName, ...rest] = name.split(' ');
-      // HI-09 fix: Use `fb_` prefix mobile — intentionally synthetic, never used for HP calls
-      // SMS skipped for fb_ prefix (handled in NotificationsService)
       user = await this.prisma.user.create({
         data: {
-          facebookId,
-          firstName,
-          lastName: rest.join(' '),
-          email,
-          mobile: `fb_${facebookId}`,   // synthetic — marks as Facebook-only account
-          // hpUserToken is NULL — user cannot initiate HP transactions until mobile is verified
+          facebookId, firstName, lastName: rest.join(' '), email,
+          mobile: `fb_${facebookId}`, // synthetic — no HP operations until mobile verified
           kycTier: 'TIER_0',
         },
       });
     }
-
     const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider });
     return {
-      user,
+      user: this.sanitizeUser(user),
       token,
-      // HI-09: Signal to frontend that mobile verification is required for payments
       requiresMobileVerification: !user.hpUserToken,
     };
   }
 
-  /**
-   * HI-09 fix: Link real mobile to Facebook account (required before HealthPay operations)
-   */
+  // ── HI-09: Link real mobile to Facebook account (Step 1 — send OTP) ────────
   async linkMobileToFacebookAccount(userId: string, mobile: string, firstName: string, lastName: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (!user.facebookId) throw new BadRequestException('This account is not a Facebook OAuth account');
+    if (user.hpUserToken) throw new BadRequestException('Mobile already linked to this account');
 
-    // Check mobile not already taken
     const existing = await this.prisma.user.findUnique({ where: { mobile } });
     if (existing && existing.id !== userId) throw new ConflictException('This mobile number is already registered');
 
-    // Send OTP to real mobile
-    await this.payment.loginUser(mobile, user.firstName, user.lastName);
-    await this.prisma.user.update({ where: { id: userId }, data: { mobile } });
-    return { success: true, message: 'OTP sent to mobile. Please verify.' };
+    // Trigger OTP via HealthPay
+    await this.payment.loginUser(mobile, firstName || user.firstName, lastName || user.lastName);
+
+    // Temporarily store intended mobile in session / DB pending verification
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { mobile }, // Update now — will be confirmed when OTP verified
+    });
+
+    await this.audit.log({ userId, operation: 'linkMobileSendOtp', requestSummary: { mobile }, responseSuccess: true });
+    return { success: true, message: 'OTP sent. Verify to complete account linking.' };
   }
 
+  // ── HI-09: Link real mobile (Step 2 — verify OTP + get HP token) ───────────
+  async verifyMobileLinking(userId: string, mobile: string, otp: string) {
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+
+    try {
+      const hpResult       = await this.payment.authUser(mobile, otp, user.isProvider);
+      const encryptedToken = encryptToken(hpResult.userToken);
+
+      const updated = await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          mobile,
+          hpUserToken:     encryptedToken,
+          hpUid:           hpResult.uid,
+          hpTokenUpdatedAt: new Date(),
+        },
+      });
+
+      await this.audit.log({ userId, operation: 'linkMobileVerify', responseSuccess: true });
+      return { success: true, message: 'Mobile linked. You can now use SettePay escrow.', user: this.sanitizeUser(updated) };
+    } catch (err: any) {
+      if (err instanceof InvalidOtpError) throw new UnauthorizedException('Invalid OTP. Please try again.');
+      throw err;
+    }
+  }
+
+  // ── Logout ──────────────────────────────────────────────────────────────────
   async logout(userId: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (user.hpUserToken && !user.mobile.startsWith('fb_')) {
@@ -132,5 +153,10 @@ export class AuthService {
     }
     await this.audit.log({ userId, operation: 'logoutUser', responseSuccess: true });
     return { success: true };
+  }
+
+  private sanitizeUser(user: any) {
+    const { hpUserToken, nationalId, passwordHash, ...safe } = user;
+    return safe;
   }
 }

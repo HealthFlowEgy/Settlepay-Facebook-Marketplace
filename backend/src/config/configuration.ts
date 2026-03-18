@@ -33,12 +33,27 @@ export default () => ({
     webhookSecret: process.env.BOSTA_WEBHOOK_SECRET,
   },
   sprint: {
-    webhookSecret: process.env.SPRINT_WEBHOOK_SECRET,  // ME-03: added
+    apiKey:        process.env.SPRINT_API_KEY,
+    webhookSecret: process.env.SPRINT_WEBHOOK_SECRET,
   },
   sms: {
     gatewayUrl: process.env.SMS_GATEWAY_URL,
     apiKey:     process.env.SMS_GATEWAY_KEY,
     senderId:   process.env.SMS_SENDER_ID || 'SettePay',
+  },
+  // Valify KYC — GAP-4 fix: was missing from configuration
+  valify: {
+    apiKey:  process.env.VALIFY_API_KEY,
+    baseUrl: process.env.VALIFY_BASE_URL || 'https://api.valify.eg',
+  },
+  aws: {
+    region:          process.env.AWS_REGION          || 'eu-west-1',
+    accessKeyId:     process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    s3Bucket:        process.env.S3_BUCKET           || 'settepay-marketplace-evidence',
+  },
+  slack: {
+    opsWebhook: process.env.SLACK_OPS_WEBHOOK,
   },
   app: {
     port:        Number(process.env.APP_PORT) || 3001,

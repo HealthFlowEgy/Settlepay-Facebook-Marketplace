@@ -1,5 +1,6 @@
 // SettePay Marketplace — Prisma Schema
-// Database: PostgreSQL
+// ME-06 fix: MerchantToken model REMOVED — merchant JWT now stored in Redis only (CR-06)
+// New: isAdmin field added to User for AdminController role guard
 
 generator client {
   provider = "prisma-client-js"
@@ -13,7 +14,7 @@ datasource db {
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
 
 enum UserKycTier {
-  TIER_0  // Phone only — EGP 200/day, 500/month
+  TIER_0  // Phone only — EGP 200/tx, 500/day, 2000/month
   TIER_1  // Phone + National ID — EGP 1,000/day
   TIER_2  // ID + selfie + address — EGP 10,000/day
   TIER_3  // Full enhanced KYC — EGP 50,000/day
@@ -27,21 +28,21 @@ enum UserKycStatus {
 }
 
 enum DealStatus {
-  PENDING                     // Deal created, waiting buyer payment initiation
-  AWAITING_BUYER_CONFIRMATION // sendPaymentRequest sent, buyer must confirm
-  AWAITING_TOP_UP             // Insufficient funds, buyer must top up
-  ESCROW_DEDUCTING            // deductFromUser in progress
-  ESCROW_ACTIVE               // Funds held, seller instructed to ship
-  SHIPPED                     // Seller marked as shipped, waybill active
-  DELIVERY_CONFIRMED          // Bosta/Sprint confirmed delivery
-  SETTLING                    // payToUser to seller in progress
-  SETTLED                     // Deal complete, funds released to seller
-  DISPUTED                    // Buyer raised dispute within 48h
-  REFUNDING                   // Auto-refund in progress
-  REFUNDED                    // Buyer refunded
-  PAYOUT_FAILED               // payToUser failed — ops intervention needed
-  PAYMENT_ERROR               // deductFromUser failed (error 6001)
-  CANCELLED                   // Deal auto-cancelled (timeout or explicit)
+  PENDING
+  AWAITING_BUYER_CONFIRMATION
+  AWAITING_TOP_UP
+  ESCROW_DEDUCTING
+  ESCROW_ACTIVE
+  SHIPPED
+  DELIVERY_CONFIRMED
+  SETTLING
+  SETTLED
+  DISPUTED
+  REFUNDING
+  REFUNDED
+  PAYOUT_FAILED
+  PAYMENT_ERROR
+  CANCELLED
 }
 
 enum DisputeStatus {
@@ -52,9 +53,9 @@ enum DisputeStatus {
 }
 
 enum DisputeResolution {
-  FULL_RELEASE  // Full amount (minus commission) to seller
-  PARTIAL       // Split between buyer and seller
-  FULL_REFUND   // Full amount to buyer
+  FULL_RELEASE
+  PARTIAL
+  FULL_REFUND
 }
 
 enum NotificationChannel {
@@ -74,50 +75,51 @@ enum NotificationStatus {
 // ─── MODELS ───────────────────────────────────────────────────────────────────
 
 model User {
-  id              String        @id @default(uuid())
-  mobile          String        @unique
-  firstName       String
-  lastName        String
-  email           String?       @unique
-  passwordHash    String?
-  isProvider      Boolean       @default(false)  // true = Seller, false = Buyer
+  id               String        @id @default(uuid())
+  mobile           String        @unique
+  firstName        String
+  lastName         String
+  email            String?       @unique
+  passwordHash     String?
+  isProvider       Boolean       @default(false)
+  isAdmin          Boolean       @default(false)  // AdminController role guard
 
   // HealthPay integration
-  hpUserToken     String?       // AES-256 encrypted HealthPay userToken
-  hpUid           String?       @unique           // HealthPay uid
+  hpUserToken      String?       // AES-256 encrypted HealthPay userToken
+  hpUid            String?       @unique
   hpTokenUpdatedAt DateTime?
 
   // KYC
-  kycTier         UserKycTier   @default(TIER_0)
-  kycStatus       UserKycStatus @default(PENDING)
-  nationalId      String?       // AES-256 encrypted
-  kycVerifiedAt   DateTime?
-  kycProvider     String?       @default("valify")
+  kycTier          UserKycTier   @default(TIER_0)
+  kycStatus        UserKycStatus @default(PENDING)
+  nationalId       String?       // AES-256 encrypted
+  kycVerifiedAt    DateTime?
+  kycProvider      String?       @default("valify")
 
   // AML tracking
-  monthlyVolume   Float         @default(0)
-  monthlyVolumeResetAt DateTime @default(now())
-  isBlocked       Boolean       @default(false)
-  blockReason     String?
+  monthlyVolume    Float         @default(0)
+  monthlyVolumeResetAt DateTime  @default(now())
+  isBlocked        Boolean       @default(false)
+  blockReason      String?
 
-  // Facebook / OAuth
-  facebookId      String?       @unique
-  facebookName    String?
+  // Facebook / OAuth (HI-09)
+  facebookId       String?       @unique
+  facebookName     String?
 
   // Messenger Bot (GAP-01 / A.2)
-  psid            String?       @unique  // Facebook Page-Scoped User ID
-  messengerLinked Boolean       @default(false)
+  psid             String?       @unique
+  messengerLinked  Boolean       @default(false)
   messengerLinkedAt DateTime?
 
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
 
   // Relations
-  dealsAsBuyer    Deal[]        @relation("BuyerDeals")
-  dealsAsSeller   Deal[]        @relation("SellerDeals")
-  disputesRaised  Dispute[]     @relation("DisputeRaisedBy")
-  notifications   NotificationEvent[]
-  auditLogs       AuditLog[]
+  dealsAsBuyer     Deal[]        @relation("BuyerDeals")
+  dealsAsSeller    Deal[]        @relation("SellerDeals")
+  disputesRaised   Dispute[]     @relation("DisputeRaisedBy")
+  notifications    NotificationEvent[]
+  auditLogs        AuditLog[]
 
   @@index([mobile])
   @@index([hpUid])
@@ -126,54 +128,53 @@ model User {
 }
 
 model Deal {
-  id              String      @id @default(uuid())
-  buyerId         String
-  sellerId        String
-  amount          Float       // Gross escrow amount in EGP
-  commission      Float?      // Calculated on settlement
-  netPayout       Float?      // amount - commission
+  id               String      @id @default(uuid())
+  buyerId          String
+  sellerId         String
+  amount           Float
+  commission       Float?
+  netPayout        Float?
 
-  status          DealStatus  @default(PENDING)
+  status           DealStatus  @default(PENDING)
 
-  // Item details
-  itemDescription String
-  itemCategory    String?
+  itemDescription  String
+  itemCategory     String?
 
   // Messenger context
-  messengerThreadId String?   // Facebook Messenger thread ID
-  botMessageId    String?     // Message ID of the deal template
+  messengerThreadId String?
+  botMessageId      String?
 
   // Logistics
-  waybillId       String?     // Bosta/Sprint waybill ID
+  waybillId        String?
   logisticsProvider String?   @default("bosta")
-  shippedAt       DateTime?
-  deliveredAt     DateTime?
+  shippedAt        DateTime?
+  deliveredAt      DateTime?
 
   // Timeline
   escrowActivatedAt  DateTime?
   buyerConfirmedAt   DateTime?
-  buyerConfirmDeadline DateTime? // 24h window for confirmation
-  disputeWindowEnd   DateTime?  // 48h after delivery
-  escrowExpiresAt    DateTime?  // 14 days after SHIPPED
+  buyerConfirmDeadline DateTime?
+  disputeWindowEnd   DateTime?
+  escrowExpiresAt    DateTime?
 
   // Idempotency
   deductIdempotencyKey String? @unique
   payoutIdempotencyKey String? @unique
 
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
-  settledAt       DateTime?
-  cancelledAt     DateTime?
-  cancelReason    String?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  settledAt        DateTime?
+  cancelledAt      DateTime?
+  cancelReason     String?
 
   // Relations
-  buyer           User        @relation("BuyerDeals", fields: [buyerId], references: [id])
-  seller          User        @relation("SellerDeals", fields: [sellerId], references: [id])
-  escrowTx        EscrowTransaction?
-  dispute         Dispute?
+  buyer            User        @relation("BuyerDeals",  fields: [buyerId],  references: [id])
+  seller           User        @relation("SellerDeals", fields: [sellerId], references: [id])
+  escrowTx         EscrowTransaction?
+  dispute          Dispute?
   commissionRecord CommissionRecord?
-  notifications   NotificationEvent[]
-  auditLogs       AuditLog[]
+  notifications    NotificationEvent[]
+  auditLogs        AuditLog[]
 
   @@index([buyerId])
   @@index([sellerId])
@@ -184,18 +185,15 @@ model Deal {
 model EscrowTransaction {
   id              String    @id @default(uuid())
   dealId          String    @unique
-  
-  // HealthPay references
-  hpDeductionRef  String?   // Description used in deductFromUser (includes dealId)
-  hpPayoutRef     String?   // Description used in payToUser (includes dealId)
-  hpPaymentReqId  String?   // ID from userPaymentRequests
 
-  // Amounts
-  amount          Float     // Gross escrow amount
+  hpDeductionRef  String?
+  hpPayoutRef     String?
+  hpPaymentReqId  String?
+
+  amount          Float
   commissionAmount Float?
   netPayout       Float?
 
-  // Status tracking
   deductedAt      DateTime?
   deductSuccess   Boolean?
   paidOutAt       DateTime?
@@ -215,24 +213,21 @@ model Dispute {
   id              String          @id @default(uuid())
   dealId          String          @unique
   raisedById      String
-  
+
   status          DisputeStatus   @default(OPEN)
   resolution      DisputeResolution?
-  
-  // Amounts (for partial resolution)
+
   sellerPayout    Float?
   buyerRefund     Float?
 
-  // Evidence
-  buyerEvidence   String[]        // S3 URLs
-  sellerEvidence  String[]        // S3 URLs
+  buyerEvidence   String[]
+  sellerEvidence  String[]
   adminNotes      String?
 
-  // Timeline
-  evidenceDeadline DateTime?      // 24h after raised
-  resolutionDeadline DateTime?    // 72h after raised
-  resolvedAt      DateTime?
-  resolvedById    String?         // Admin user ID
+  evidenceDeadline   DateTime?
+  resolutionDeadline DateTime?
+  resolvedAt         DateTime?
+  resolvedById       String?
 
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
@@ -245,19 +240,18 @@ model Dispute {
 }
 
 model CommissionRecord {
-  id              String    @id @default(uuid())
-  dealId          String    @unique
-  
-  grossAmount     Float
-  commissionRate  Float
+  id               String    @id @default(uuid())
+  dealId           String    @unique
+
+  grossAmount      Float
+  commissionRate   Float
   commissionAmount Float
-  netPayout       Float
-  
-  hpPayoutRef     String?
+  netPayout        Float
+  hpPayoutRef      String?
 
-  createdAt       DateTime  @default(now())
+  createdAt        DateTime  @default(now())
 
-  deal            Deal      @relation(fields: [dealId], references: [id])
+  deal             Deal      @relation(fields: [dealId], references: [id])
 
   @@index([dealId])
   @@index([createdAt])
@@ -267,18 +261,14 @@ model AuditLog {
   id              String    @id @default(uuid())
   userId          String?
   dealId          String?
-  
-  operation       String    // e.g., "authMerchant", "deductFromUser", "payToUser"
-  hpOperation     String?   // HealthPay GraphQL operation name
-  
-  // Sanitized request/response (tokens REDACTED)
-  requestSummary  Json?     // { operation, variables (sanitized) }
-  responseCode    String?   // "SUCCESS" or error code
-  responseSuccess Boolean?
-  
-  outcome         String?   // Human-readable outcome
-  errorMessage    String?
 
+  operation       String
+  hpOperation     String?
+  requestSummary  Json?
+  responseCode    String?
+  responseSuccess Boolean?
+  outcome         String?
+  errorMessage    String?
   ipAddress       String?
   userAgent       String?
 
@@ -294,56 +284,50 @@ model AuditLog {
 }
 
 model NotificationEvent {
-  id              String              @id @default(uuid())
-  userId          String
-  dealId          String?
-  
-  channel         NotificationChannel
-  type            String              // e.g., "deal_confirmed", "escrow_active", "delivered"
-  status          NotificationStatus  @default(QUEUED)
-  
-  payload         Json?               // Message content
-  externalId      String?             // Messenger message ID / SMS reference
-  
-  error           String?
-  sentAt          DateTime?
-  deliveredAt     DateTime?
+  id          String              @id @default(uuid())
+  userId      String
+  dealId      String?
 
-  createdAt       DateTime            @default(now())
+  channel     NotificationChannel
+  type        String
+  status      NotificationStatus  @default(QUEUED)
+  payload     Json?
+  externalId  String?
+  error       String?
+  sentAt      DateTime?
+  deliveredAt DateTime?
 
-  user            User                @relation(fields: [userId], references: [id])
-  deal            Deal?               @relation(fields: [dealId], references: [id])
+  createdAt   DateTime            @default(now())
+
+  user        User                @relation(fields: [userId], references: [id])
+  deal        Deal?               @relation(fields: [dealId], references: [id])
 
   @@index([userId])
   @@index([dealId])
   @@index([status])
 }
 
-// ─── Messenger Bot Session (GAP-01 / A.2) ─────────────────────────────────────
-
+// Messenger Bot session (GAP-01 / A.2)
 model BotSession {
   id        String   @id @default(cuid())
   psid      String   @unique
-  state     String   @default("IDLE")  // BotSessionState enum
-  context   Json?                       // wizard in-progress data
-  dealId    String?                     // active deal being constructed
-  userId    String?                     // linked SettePay user
+  state     String   @default("IDLE")
+  context   Json?
+  dealId    String?
+  userId    String?
   updatedAt DateTime @updatedAt
 
   @@index([psid])
 }
 
-model MerchantToken {
-  id              String    @id @default("singleton")
-  token           String    // Current HealthPay merchant JWT
-  expiresAt       DateTime
-  refreshedAt     DateTime  @default(now())
-}
+// ME-06: MerchantToken model REMOVED.
+// Merchant JWT is stored exclusively in Redis (hp:merchant:token key, 23h TTL).
+// Migration: DROP TABLE IF EXISTS "MerchantToken";
 
 model OtpThrottle {
-  mobile          String    @id
-  attempts        Int       @default(0)
-  blockedUntil    DateTime?
-  lastAttemptAt   DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  mobile        String    @id
+  attempts      Int       @default(0)
+  blockedUntil  DateTime?
+  lastAttemptAt DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 }
