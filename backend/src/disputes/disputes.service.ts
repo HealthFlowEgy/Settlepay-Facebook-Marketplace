@@ -81,8 +81,11 @@ export class DisputesService {
       include: { buyer: true, seller: true },
     });
 
-    const buyerToken  = decryptToken(deal.buyer.hpUserToken!);
-    const sellerToken = decryptToken(deal.seller.hpUserToken!);
+    // GAP-FIX-03: Guard against missing HP tokens before attempting payment
+    if (!deal.buyer.hpUserToken) throw new BadRequestException('Buyer HealthPay token missing — buyer must re-authenticate');
+    if (!deal.seller.hpUserToken) throw new BadRequestException('Seller HealthPay token missing — seller must re-authenticate');
+    const buyerToken  = decryptToken(deal.buyer.hpUserToken);
+    const sellerToken = decryptToken(deal.seller.hpUserToken);
 
     if (resolution === DisputeResolution.FULL_RELEASE) {
       // ME-07 fix: Use CommissionService instead of hardcoded 0.018
@@ -93,9 +96,13 @@ export class DisputesService {
       await this.audit.log({ dealId: deal.id, userId: adminId, operation: 'resolveDispute:fullRelease', requestSummary: { netPayout }, responseSuccess: true });
 
     } else if (resolution === DisputeResolution.PARTIAL) {
-      if (!sellerPayout || !buyerRefund) throw new BadRequestException('sellerPayout and buyerRefund required for PARTIAL');
-      // Validate: sellerPayout + buyerRefund must not exceed deal.amount
-      if (sellerPayout + buyerRefund > deal.amount) throw new BadRequestException('Split amounts exceed deal amount');
+      if (sellerPayout == null || buyerRefund == null) throw new BadRequestException('sellerPayout and buyerRefund required for PARTIAL');
+      // GAP-FIX-10: Validate split amounts sum to exactly deal.amount (no money lost or created)
+      const splitTotal = Math.round((sellerPayout + buyerRefund) * 100) / 100;
+      const dealAmount = Math.round(deal.amount * 100) / 100;
+      if (splitTotal !== dealAmount) {
+        throw new BadRequestException(`sellerPayout (${sellerPayout}) + buyerRefund (${buyerRefund}) must equal deal amount (${deal.amount})`);
+      }
       const [r1, r2] = await Promise.all([
         this.payment.payToUser(sellerToken, sellerPayout, `SettePay Dispute:PartialRelease - Deal#${deal.id}`),
         this.payment.payToUser(buyerToken,  buyerRefund,  `SettePay Dispute:PartialRefund - Deal#${deal.id}`),

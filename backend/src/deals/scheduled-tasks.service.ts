@@ -95,4 +95,17 @@ export class ScheduledTasksService {
     });
     this.logger.log(`Monthly volume reset for ${result.count} users`);
   }
+
+  /**
+   * GAP-FIX-19: Daily cleanup of stale BotSession records.
+   * Sessions idle for more than 7 days are pruned to prevent unbounded table growth.
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  async cleanupStaleBotSessions() {
+    const cutoff = new Date(Date.now() - 7 * 86_400_000);
+    const result = await this.prisma.botSession.deleteMany({
+      where: { updatedAt: { lt: cutoff } },
+    });
+    if (result.count > 0) this.logger.log(`Pruned ${result.count} stale BotSession records older than 7 days`);
+  }
 }

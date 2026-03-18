@@ -13,9 +13,14 @@ export class KycService {
   async checkAndEscalate(userId: string, transactionAmount: number) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
 
-    // Reset monthly volume if new month
+    // GAP-FIX-09: Year-aware monthly volume reset — getMonth() alone would incorrectly
+    // treat January 2025 and January 2026 as the same month.
     const now = new Date();
-    if (user.monthlyVolumeResetAt.getMonth() !== now.getMonth()) {
+    const resetAt = user.monthlyVolumeResetAt;
+    const isDifferentMonth =
+      resetAt.getFullYear() !== now.getFullYear() ||
+      resetAt.getMonth()    !== now.getMonth();
+    if (isDifferentMonth) {
       await this.prisma.user.update({
         where: { id: userId },
         data:  { monthlyVolume: 0, monthlyVolumeResetAt: now },

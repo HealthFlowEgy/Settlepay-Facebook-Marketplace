@@ -6,7 +6,7 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../common/prisma.service';
 import { PAYMENT_SERVICE, IPaymentService } from '../payment/payment.service.interface';
-import { encryptToken } from '../common/crypto.util';
+import { encryptToken, decryptToken } from '../common/crypto.util';
 import { OtpThrottleError, InvalidOtpError } from '../payment/healthpay.adapter';
 import { AuditService } from '../audit/audit.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -96,6 +96,10 @@ export class AuthService {
   }
 
   // ── HI-09: Link real mobile to Facebook account (Step 1 — send OTP) ────────
+  // GAP-FIX-01: Do NOT update mobile in DB before OTP is verified (TOCTOU).
+  // The intended mobile is only committed to the DB in step 2 (verifyMobileLinking),
+  // after HealthPay confirms the OTP. This prevents a race condition where an
+  // attacker could claim a mobile number belonging to another user.
   async linkMobileToFacebookAccount(userId: string, mobile: string, firstName: string, lastName: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (!user.facebookId) throw new BadRequestException('This account is not a Facebook OAuth account');
@@ -104,14 +108,8 @@ export class AuthService {
     const existing = await this.prisma.user.findUnique({ where: { mobile } });
     if (existing && existing.id !== userId) throw new ConflictException('This mobile number is already registered');
 
-    // Trigger OTP via HealthPay
+    // Trigger OTP via HealthPay — do NOT persist mobile until OTP is verified
     await this.payment.loginUser(mobile, firstName || user.firstName, lastName || user.lastName);
-
-    // Temporarily store intended mobile in session / DB pending verification
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { mobile }, // Update now — will be confirmed when OTP verified
-    });
 
     await this.audit.log({ userId, operation: 'linkMobileSendOtp', requestSummary: { mobile }, responseSuccess: true });
     return { success: true, message: 'OTP sent. Verify to complete account linking.' };
@@ -121,16 +119,23 @@ export class AuthService {
   async verifyMobileLinking(userId: string, mobile: string, otp: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
 
+    // Re-check mobile uniqueness at commit time (prevents race condition)
+    const existing = await this.prisma.user.findUnique({ where: { mobile } });
+    if (existing && existing.id !== userId) {
+      throw new ConflictException('This mobile number is already registered');
+    }
+
     try {
       const hpResult       = await this.payment.authUser(mobile, otp, user.isProvider);
       const encryptedToken = encryptToken(hpResult.userToken);
 
+      // GAP-FIX-01: Mobile is only persisted here, after successful OTP verification
       const updated = await this.prisma.user.update({
         where: { id: userId },
         data: {
           mobile,
-          hpUserToken:     encryptedToken,
-          hpUid:           hpResult.uid,
+          hpUserToken:      encryptedToken,
+          hpUid:            hpResult.uid,
           hpTokenUpdatedAt: new Date(),
         },
       });
@@ -144,10 +149,10 @@ export class AuthService {
   }
 
   // ── Logout ──────────────────────────────────────────────────────────────────
+  // GAP-FIX-20: Use static import of decryptToken (was needlessly dynamic)
   async logout(userId: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (user.hpUserToken && !user.mobile.startsWith('fb_')) {
-      const { decryptToken } = await import('../common/crypto.util');
       const hpToken = decryptToken(user.hpUserToken);
       await this.payment.logoutUser(hpToken).catch(() => {});
     }

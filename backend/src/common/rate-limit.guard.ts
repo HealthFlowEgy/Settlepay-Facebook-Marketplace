@@ -32,11 +32,14 @@ export class RateLimitGuard implements CanActivate {
     const ip   = req.ip || req.connection?.remoteAddress || 'unknown';
     const key  = `ratelimit:${req.path}:${ip}`;
 
-    // Redis-backed sliding window counter
-    const current = await this.redis.incr(key);
-    if (current === 1) {
-      await this.redis.expire(key, windowSeconds);
-    }
+    // GAP-FIX-06: Use pipeline to make INCR + EXPIRE atomic, preventing a race
+    // condition where two simultaneous first-requests both get current=1 and
+    // compete to set TTL — leaving the key without expiry if one call is lost.
+    const pipeline = this.redis.pipeline();
+    pipeline.incr(key);
+    pipeline.expire(key, windowSeconds, 'NX'); // NX = only set if not already set
+    const results  = await pipeline.exec();
+    const current  = (results?.[0]?.[1] as number) ?? 0;
 
     if (current > limit) {
       const ttl = await this.redis.ttl(key);

@@ -32,17 +32,19 @@ export class NotificationsService {
     if (!msgFn) { this.logger.warn(`No message template for type: ${type}`); return; }
     const { title, body } = msgFn(deal, meta);
 
+    // GAP-FIX-11: Notify both parties in parallel — no need to wait for one before the other
     const partyIds = [deal.buyerId, deal.sellerId].filter(Boolean);
-    for (const userId of partyIds) {
-      await this.notifyUser(userId, type, { title, body, dealId: deal.id }, ['messenger', 'sms', 'push']);
-    }
+    await Promise.all(
+      partyIds.map(userId => this.notifyUser(userId, type, { title, body, dealId: deal.id }, ['messenger', 'sms', 'push'])),
+    );
   }
 
   async notifyUser(userId: string, type: string, payload: Record<string, any>, channels: string[]) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) return;
 
-    for (const channel of channels) {
+    // GAP-FIX-11: Deliver to all channels in parallel to reduce total latency
+    await Promise.all(channels.map(async channel => {
       const event = await this.prisma.notificationEvent.create({
         data: { userId, dealId: payload.dealId, channel: channel.toUpperCase() as any, type, payload },
       });
@@ -60,7 +62,7 @@ export class NotificationsService {
         this.logger.error(`Notification failed [${channel}] user ${userId}: ${err.message}`);
         await this.prisma.notificationEvent.update({ where: { id: event.id }, data: { status: 'FAILED', error: err.message } });
       }
-    }
+    }));
   }
 
   // CR-04 fix: Authorization Bearer header — not URL query param

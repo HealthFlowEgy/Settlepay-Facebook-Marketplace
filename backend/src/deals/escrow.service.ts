@@ -1,6 +1,6 @@
 import {
   Injectable, Inject, Logger, BadRequestException,
-  NotFoundException, ConflictException,
+  NotFoundException, ConflictException, ForbiddenException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../common/prisma.service';
@@ -9,6 +9,8 @@ import { decryptToken, generateIdempotencyKey } from '../common/crypto.util';
 import { CommissionService } from '../commission/commission.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditService } from '../audit/audit.service';
+import { AmlService } from '../common/aml.service';
+import { KycService } from '../kyc/kyc.service';
 import { InsufficientFundsError, GatewayError } from '../payment/healthpay.adapter';
 import { DealStatus } from '@prisma/client';
 
@@ -22,6 +24,8 @@ export class EscrowService {
     private readonly commission: CommissionService,
     private readonly notifications: NotificationsService,
     private readonly audit: AuditService,
+    private readonly aml: AmlService,
+    private readonly kyc: KycService,
     @Inject(PAYMENT_SERVICE) private readonly payment: IPaymentService,
   ) {}
 
@@ -29,6 +33,21 @@ export class EscrowService {
   async initiateDeal(sellerId: string, buyerId: string, amount: number, itemDescription: string, messengerThreadId?: string) {
     if (amount < 50)      throw new BadRequestException('Minimum deal amount is EGP 50');
     if (amount > 50_000)  throw new BadRequestException('Maximum deal amount is EGP 50,000');
+
+    // GAP-FIX-15: Run AML velocity check on the seller before creating a deal.
+    // KYC escalation check ensures neither party is below their required tier.
+    const sellerAml = await this.aml.checkTransaction(sellerId, amount);
+    if (sellerAml.blocked) {
+      throw new ForbiddenException(sellerAml.reason || 'Deal blocked by AML policy');
+    }
+
+    // Check seller KYC tier — will throw KYC_REQUIRED if threshold breached
+    await this.kyc.checkAndEscalate(sellerId, amount);
+
+    // Check buyer is not blocked
+    const buyer = await this.prisma.user.findUnique({ where: { id: buyerId }, select: { isBlocked: true, blockReason: true } });
+    if (!buyer) throw new BadRequestException(`Buyer ${buyerId} not found`);
+    if (buyer.isBlocked) throw new ForbiddenException(`Buyer account is restricted: ${buyer.blockReason || 'contact support'}`);
 
     const confirmDeadline = new Date(Date.now() + this.config.get<number>('escrow.buyerConfirmTimeoutHours') * 3_600_000);
 
@@ -86,9 +105,12 @@ export class EscrowService {
         hpOperation: 'deductFromUser', requestSummary: { amount: deal.amount, description }, responseSuccess: result.isSuccess });
 
       if (result.isSuccess) {
-        const expiresAt = new Date(Date.now() + this.config.get<number>('escrow.deliveryExpiryDays') * 86_400_000);
+        // GAP-FIX-13: Set buyerConfirmedAt when escrow deduction succeeds
         await this.prisma.$transaction([
-          this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.ESCROW_ACTIVE, escrowActivatedAt: new Date(), escrowExpiresAt: expiresAt } }),
+          this.prisma.deal.update({
+            where: { id: dealId },
+            data: { status: DealStatus.ESCROW_ACTIVE, escrowActivatedAt: new Date(), buyerConfirmedAt: new Date() },
+          }),
           this.prisma.escrowTransaction.upsert({
             where:  { dealId },
             create: { dealId, hpDeductionRef: description, amount: deal.amount, deductedAt: new Date(), deductSuccess: true },
@@ -153,9 +175,14 @@ export class EscrowService {
     if (deal.sellerId !== sellerId) throw new BadRequestException('Not authorized');
     if (deal.status !== DealStatus.ESCROW_ACTIVE) throw new ConflictException('Deal must be in ESCROW_ACTIVE state');
 
+    // GAP-FIX-07: escrowExpiresAt is counted from shipment time, not from escrow activation.
+    // A seller who ships on day 0 gets the full 14-day delivery window.
+    const shippedAt  = new Date();
+    const expiresAt  = new Date(shippedAt.getTime() + this.config.get<number>('escrow.deliveryExpiryDays') * 86_400_000);
+
     const updatedDeal = await this.prisma.deal.update({
       where: { id: dealId },
-      data:  { status: DealStatus.SHIPPED, shippedAt: new Date(), waybillId },
+      data:  { status: DealStatus.SHIPPED, shippedAt, waybillId, escrowExpiresAt: expiresAt },
       include: { buyer: true, seller: true },
     });
     await this.notifications.sendDealNotification(updatedDeal, 'shipped');
@@ -232,15 +259,25 @@ export class EscrowService {
       if (result.isSuccess) {
         await this.prisma.$transaction([
           this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.SETTLED, settledAt: new Date(), commission, netPayout } }),
-          this.prisma.escrowTransaction.update({ where: { dealId }, data: { paidOutAt: new Date(), payoutSuccess: true } }),
+          // GAP-FIX-12: Increment payoutAttempts so ops can track retry count
+          this.prisma.escrowTransaction.update({
+            where: { dealId },
+            data: { paidOutAt: new Date(), payoutSuccess: true, payoutAttempts: { increment: 1 } },
+          }),
         ]);
         await this.notifications.sendDealNotification({ ...deal, status: DealStatus.SETTLED }, 'deal_settled', { netPayout, commission });
       } else {
-        await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } });
+        await this.prisma.$transaction([
+          this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } }),
+          this.prisma.escrowTransaction.update({ where: { dealId }, data: { payoutAttempts: { increment: 1 } } }),
+        ]);
         await this.notifications.alertOpsTeam(dealId, 'Retry payout failed — MANUAL RESOLUTION REQUIRED');
       }
     } catch (err: any) {
-      await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } });
+      await this.prisma.$transaction([
+        this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } }),
+        this.prisma.escrowTransaction.updateMany({ where: { dealId }, data: { payoutAttempts: { increment: 1 } } }),
+      ]).catch(() => {});
       await this.notifications.alertOpsTeam(dealId, `Retry payout exception: ${err.message} — MANUAL RESOLUTION REQUIRED`);
     }
   }

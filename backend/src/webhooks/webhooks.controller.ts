@@ -116,6 +116,8 @@ export class WebhooksController {
     const deliveredStates = ['DELIVERED', 'delivered', '45'];
     const isDelivered = deliveredStates.includes(payload.state) || deliveredStates.includes(String(payload.stateCode));
 
+    // GAP-FIX-14: Idempotency guard — only process delivery once (deal must still be SHIPPED).
+    // Duplicate Bosta webhooks for the same waybill are silently ignored.
     if (isDelivered && deal.status === DealStatus.SHIPPED) {
       await this.prisma.deal.update({ where: { id: deal.id }, data: { status: DealStatus.DELIVERY_CONFIRMED, deliveredAt: new Date() } });
       await this.notifications.sendDealNotification(deal, 'delivery_confirmed');
@@ -131,6 +133,8 @@ export class WebhooksController {
       }
 
       await this.escrow.releaseEscrowOnDelivery(deal.id);
+    } else if (isDelivered) {
+      this.logger.log(`Bosta delivery webhook ignored — deal ${deal.id} already in ${deal.status} state (idempotent)`);
     }
 
     return 'OK';
@@ -144,7 +148,8 @@ export class WebhooksController {
     @Headers('x-sprint-signature') signature: string,
   ) {
     // ME-03 fix: HMAC verification
-    const secret = this.config.get<string>('sprint.webhookSecret') || process.env.SPRINT_WEBHOOK_SECRET;
+    // GAP-FIX-21: Use ConfigService consistently — no direct process.env access
+    const secret = this.config.get<string>('sprint.webhookSecret');
     if (secret) {
       if (!signature) {
         if (process.env.NODE_ENV === 'production') throw new BadRequestException('Missing Sprint signature');
@@ -164,10 +169,13 @@ export class WebhooksController {
     });
     if (!deal) return 'OK';
 
+    // GAP-FIX-14: Same idempotency guard as Bosta webhook
     if (payload.status === 'DELIVERED' && deal.status === DealStatus.SHIPPED) {
       await this.prisma.deal.update({ where: { id: deal.id }, data: { status: DealStatus.DELIVERY_CONFIRMED, deliveredAt: new Date() } });
       await this.notifications.sendDealNotification(deal, 'delivery_confirmed');
       await this.escrow.releaseEscrowOnDelivery(deal.id);
+    } else if (payload.status === 'DELIVERED') {
+      this.logger.log(`Sprint delivery webhook ignored — deal ${deal.id} already in ${deal.status} state (idempotent)`);
     }
 
     return 'OK';

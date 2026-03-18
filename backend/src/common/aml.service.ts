@@ -105,11 +105,14 @@ export class AmlService {
     }
 
     // Rule 4: Round-amount structuring
+    // GAP-FIX-04: Only count deals whose amount is also a round number (not all recent deals)
     const isRound = amount % 500 === 0 || amount % 1000 === 0;
     if (isRound) {
-      const recentRoundCount = await this.prisma.deal.count({
+      const recentDeals = await this.prisma.deal.findMany({
         where: { OR: [{ buyerId: userId }, { sellerId: userId }], createdAt: { gte: new Date(Date.now() - 3 * 86_400_000) } },
+        select: { amount: true },
       });
+      const recentRoundCount = recentDeals.filter(d => d.amount % 500 === 0 || d.amount % 1000 === 0).length;
       if (recentRoundCount >= 5) {
         flags.push(`${recentRoundCount} recent round-amount transactions (potential structuring)`);
         ruleIds.push('ROUND_AMOUNT_SERIES');
@@ -150,7 +153,11 @@ export class AmlService {
     };
     this.logger.error('STR FILING REQUIRED', JSON.stringify(strPayload));
     await this.notifications.alertOpsTeam(userId, `⚠️ STR REQUIRED within 24h — EGP ${amount} — Rules: ${ruleIds.join(', ')}`);
-    await this.prisma.user.update({ where: { id: userId }, data: { blockReason: `AML flag: ${ruleIds.join(',')}` } });
+    // GAP-FIX-08: STR filing must also set isBlocked=true — user cannot continue transacting
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { isBlocked: true, blockReason: `AML STR filed: ${ruleIds.join(',')}` },
+    });
     await this.audit.log({ userId, operation: 'str_filed', requestSummary: strPayload, responseSuccess: true, outcome: 'STR filed' });
   }
 

@@ -120,11 +120,21 @@ export class HealthPayAdapter implements IPaymentService, OnModuleInit {
       headers['Authorization'] = `Bearer ${this.merchantToken}`;
     }
 
-    const res  = await fetch(baseUrl!, {
-      method:  'POST',
-      headers,
-      body:    JSON.stringify({ query, variables }),
-    });
+    // GAP-FIX-17: Set a request timeout — a hung HealthPay endpoint would otherwise
+    // block the request thread indefinitely (default: 10s)
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 10_000);
+    let res: Response;
+    try {
+      res = await fetch(baseUrl!, {
+        method:  'POST',
+        headers,
+        body:    JSON.stringify({ query, variables }),
+        signal:  controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     const json = await res.json() as any;
 
