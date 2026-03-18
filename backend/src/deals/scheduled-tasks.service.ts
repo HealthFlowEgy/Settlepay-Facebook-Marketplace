@@ -87,6 +87,38 @@ export class ScheduledTasksService {
     if (overdue.length) this.logger.warn(`${overdue.length} overdue disputes requiring immediate action`);
   }
 
+  /**
+   * REM-01/REM-02: Every 5 minutes — retry deals stuck in PAYMENT_ERROR or PAYOUT_FAILED.
+   * retryEscrowDeduction / retryPayout enforce the maxRetryAttempts cap internally and
+   * alert ops when the cap is reached, so this cron simply fans out to all errored deals.
+   */
+  @Cron('*/5 * * * *')
+  async retryFailedPayments() {
+    const [erroredDeductions, failedPayouts] = await Promise.all([
+      this.prisma.deal.findMany({ where: { status: DealStatus.PAYMENT_ERROR }, select: { id: true } }),
+      this.prisma.deal.findMany({ where: { status: DealStatus.PAYOUT_FAILED }, select: { id: true } }),
+    ]);
+
+    for (const deal of erroredDeductions) {
+      try {
+        await this.escrow.retryEscrowDeduction(deal.id);
+      } catch (err: any) {
+        this.logger.error(`retryEscrowDeduction(${deal.id}) threw: ${err.message}`);
+      }
+    }
+
+    for (const deal of failedPayouts) {
+      try {
+        await this.escrow.retryPayout(deal.id);
+      } catch (err: any) {
+        this.logger.error(`retryPayout(${deal.id}) threw: ${err.message}`);
+      }
+    }
+
+    const total = erroredDeductions.length + failedPayouts.length;
+    if (total > 0) this.logger.log(`Retry cycle: ${erroredDeductions.length} deductions, ${failedPayouts.length} payouts processed`);
+  }
+
   /** Daily: reset monthly volume counters on 1st of each month */
   @Cron('0 0 1 * *')
   async resetMonthlyVolumes() {

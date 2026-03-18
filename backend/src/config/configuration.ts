@@ -22,6 +22,8 @@ export default () => ({
     deliveryExpiryDays:       Number(process.env.ESCROW_DELIVERY_EXPIRY_DAYS)        || 14,
     disputeWindowHours:       Number(process.env.DISPUTE_WINDOW_HOURS)               || 48,
     disputeResolutionHours:   Number(process.env.DISPUTE_RESOLUTION_HOURS)           || 72,
+    // Maximum automatic retry attempts before escalating to ops for manual resolution
+    maxRetryAttempts:         Number(process.env.ESCROW_MAX_RETRY_ATTEMPTS)          || 3,
   },
   meta: {
     pageAccessToken: process.env.META_PAGE_ACCESS_TOKEN,

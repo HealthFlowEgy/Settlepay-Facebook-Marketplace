@@ -195,11 +195,12 @@ model EscrowTransaction {
   commissionAmount Decimal? @db.Decimal(12, 2)
   netPayout       Decimal?  @db.Decimal(12, 2)
 
-  deductedAt      DateTime?
-  deductSuccess   Boolean?
-  paidOutAt       DateTime?
-  payoutSuccess   Boolean?
-  payoutAttempts  Int       @default(0)
+  deductedAt        DateTime?
+  deductSuccess     Boolean?
+  deductionAttempts Int       @default(0)  // GAP-FIX: tracks deduction retry count for cap enforcement
+  paidOutAt         DateTime?
+  payoutSuccess     Boolean?
+  payoutAttempts    Int       @default(0)
 
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt

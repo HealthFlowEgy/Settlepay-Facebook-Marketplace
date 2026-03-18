@@ -65,7 +65,9 @@ export class AuthService {
       });
 
       await this.prisma.otpThrottle.deleteMany({ where: { mobile } }).catch(() => {});
-      const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider });
+      // REM-03: Include isAdmin in the JWT so AdminGuard reads it from the token
+      // without an extra DB round-trip on every admin request.
+      const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider, isAdmin: user.isAdmin });
       await this.audit.log({ userId: user.id, operation: 'authUser', responseSuccess: true });
       return { user: this.sanitizeUser(user), token };
     } catch (err: any) {
@@ -87,7 +89,7 @@ export class AuthService {
         },
       });
     }
-    const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider });
+    const token = this.jwt.sign({ sub: user.id, mobile: user.mobile, isProvider: user.isProvider, isAdmin: user.isAdmin });
     return {
       user: this.sanitizeUser(user),
       token,

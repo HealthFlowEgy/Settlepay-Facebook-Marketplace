@@ -65,8 +65,35 @@ export class DisputesService {
     const isSeller = deal.sellerId === userId;
     if (!isBuyer && !isSeller) throw new BadRequestException('Not a party to this dispute');
 
+    // REM-04: Validate evidence URLs — must be well-formed HTTPS URLs.
+    // Rejects: bare filenames, http:// links, javascript: URIs, relative paths, etc.
+    // In production these should be S3 presigned URLs from the configured bucket.
+    if (!Array.isArray(evidenceUrls) || evidenceUrls.length === 0) {
+      throw new BadRequestException('At least one evidence URL is required');
+    }
+    if (evidenceUrls.length > 10) {
+      throw new BadRequestException('Maximum 10 evidence files per submission');
+    }
+    for (const url of evidenceUrls) {
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        throw new BadRequestException(`Invalid evidence URL: "${url}"`);
+      }
+      if (parsed.protocol !== 'https:') {
+        throw new BadRequestException(`Evidence URLs must use HTTPS. Received: "${url}"`);
+      }
+    }
+
+    if (dispute.evidenceDeadline && dispute.evidenceDeadline < new Date()) {
+      throw new BadRequestException('Evidence submission deadline has passed');
+    }
+
     const updateData = isBuyer ? { buyerEvidence: evidenceUrls } : { sellerEvidence: evidenceUrls };
-    return this.prisma.dispute.update({ where: { id: disputeId }, data: updateData });
+    const updated = await this.prisma.dispute.update({ where: { id: disputeId }, data: updateData });
+    await this.audit.log({ dealId: deal.id, userId, operation: 'submitEvidence', requestSummary: { count: evidenceUrls.length }, responseSuccess: true });
+    return updated;
   }
 
   async resolveDispute(

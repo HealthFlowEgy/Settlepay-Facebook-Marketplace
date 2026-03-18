@@ -13,6 +13,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
   validate(payload: any) {
-    return { sub: payload.sub, mobile: payload.mobile, isProvider: payload.isProvider };
+    // REM-03: isAdmin from JWT payload — no DB lookup needed in AdminGuard
+    return { sub: payload.sub, mobile: payload.mobile, isProvider: payload.isProvider, isAdmin: payload.isAdmin ?? false };
   }
 }

@@ -1,11 +1,12 @@
 import {
   Controller, Get, Post, Body, Param, Query,
-  UseGuards, HttpCode, ForbiddenException, Req,
+  UseGuards, HttpCode, Req,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt.guard';
+import { AdminGuard } from '../auth/admin.guard';
 import { DisputesService } from '../disputes/disputes.service';
 import { PrismaService } from '../common/prisma.service';
-import { DisputeResolution, DealStatus } from '@prisma/client';
+import { DisputeResolution, DealStatus, DisputeStatus, UserKycTier } from '@prisma/client';
 import { IsEnum, IsOptional, IsString, IsNumber } from 'class-validator';
 
 class ResolveDto {
@@ -16,51 +17,48 @@ class ResolveDto {
 }
 
 /**
- * AdminController — Fixed: added isAdmin role guard
- * All admin endpoints require JWT + isAdmin flag on user record.
+ * AdminController — REM-03: Switched from per-method DB lookup to AdminGuard.
+ * AdminGuard reads isAdmin from the JWT payload (no DB hit per request).
+ * REM-05: All Prisma enum comparisons now use generated enum values, not string literals.
  */
 @Controller('admin')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, AdminGuard)
 export class AdminController {
   constructor(
     private readonly disputes: DisputesService,
     private readonly prisma: PrismaService,
   ) {}
 
-  // ── Role guard helper — checks isAdmin on the User record ─────────────────
-  private async requireAdmin(userId: string): Promise<void> {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user?.isAdmin) {
-      throw new ForbiddenException('Admin access required');
-    }
-  }
-
   // ── Disputes ──────────────────────────────────────────────────────────────
   @Get('disputes')
-  async getAllDisputes(@Req() req: any, @Query('status') status?: string) {
-    await this.requireAdmin(req.user.sub);
-    return this.disputes.getAllDisputes(status as any);
+  getAllDisputes(@Query('status') status?: string) {
+    // REM-05: Cast through DisputeStatus enum — invalid values become undefined (safe)
+    const enumStatus = status && Object.values(DisputeStatus).includes(status as DisputeStatus)
+      ? status as DisputeStatus
+      : undefined;
+    return this.disputes.getAllDisputes(enumStatus);
   }
 
   @Get('disputes/:id')
-  async getDispute(@Req() req: any, @Param('id') id: string) {
-    await this.requireAdmin(req.user.sub);
+  getDispute(@Param('id') id: string) {
     return this.disputes.getDispute(id);
   }
 
   @Post('disputes/:id/resolve')
   @HttpCode(200)
-  async resolveDispute(@Req() req: any, @Param('id') id: string, @Body() dto: ResolveDto) {
-    await this.requireAdmin(req.user.sub);
+  resolveDispute(@Req() req: any, @Param('id') id: string, @Body() dto: ResolveDto) {
     return this.disputes.resolveDispute(id, req.user.sub, dto.resolution, dto.adminNotes, dto.sellerPayout, dto.buyerRefund);
   }
 
   // ── Deals ─────────────────────────────────────────────────────────────────
   @Get('deals')
-  async getDeals(@Req() req: any, @Query('status') status?: string, @Query('limit') limit = '50') {
-    await this.requireAdmin(req.user.sub);
+  getDeals(@Query('status') status?: string, @Query('limit') limit = '50') {
+    // REM-05: Use DealStatus enum values, reject invalid strings
+    const enumStatus = status && Object.values(DealStatus).includes(status as DealStatus)
+      ? status as DealStatus
+      : undefined;
     return this.prisma.deal.findMany({
-      where:   status ? { status: status as DealStatus } : undefined,
+      where:   enumStatus ? { status: enumStatus } : undefined,
       orderBy: { createdAt: 'desc' },
       take:    parseInt(limit, 10),
       include: {
@@ -72,30 +70,37 @@ export class AdminController {
   }
 
   @Get('deals/stats')
-  async getStats(@Req() req: any) {
-    await this.requireAdmin(req.user.sub);
+  async getStats() {
+    // REM-05: Use Prisma DealStatus / DisputeStatus enum values, not raw strings
     const [total, active, settled, disputed, commissionTotal] = await Promise.all([
       this.prisma.deal.count(),
-      this.prisma.deal.count({ where: { status: { in: ['ESCROW_ACTIVE', 'SHIPPED', 'DELIVERY_CONFIRMED'] } } }),
-      this.prisma.deal.count({ where: { status: 'SETTLED' } }),
-      this.prisma.dispute.count({ where: { status: { in: ['OPEN', 'EVIDENCE_COLLECTION', 'UNDER_REVIEW'] } } }),
+      this.prisma.deal.count({
+        where: { status: { in: [DealStatus.ESCROW_ACTIVE, DealStatus.SHIPPED, DealStatus.DELIVERY_CONFIRMED] } },
+      }),
+      this.prisma.deal.count({ where: { status: DealStatus.SETTLED } }),
+      this.prisma.dispute.count({
+        where: { status: { in: [DisputeStatus.OPEN, DisputeStatus.EVIDENCE_COLLECTION, DisputeStatus.UNDER_REVIEW] } },
+      }),
       this.prisma.commissionRecord.aggregate({ _sum: { commissionAmount: true } }),
     ]);
     return {
-      totalDeals:       total,
-      activeEscrows:    active,
-      settledDeals:     settled,
-      openDisputes:     disputed,
-      totalCommission:  commissionTotal._sum.commissionAmount ?? 0,
+      totalDeals:      total,
+      activeEscrows:   active,
+      settledDeals:    settled,
+      openDisputes:    disputed,
+      totalCommission: commissionTotal._sum.commissionAmount ?? 0,
     };
   }
 
   // ── Users ─────────────────────────────────────────────────────────────────
   @Get('users')
-  async getUsers(@Req() req: any, @Query('kycTier') kycTier?: string, @Query('limit') limit = '50') {
-    await this.requireAdmin(req.user.sub);
+  getUsers(@Query('kycTier') kycTier?: string, @Query('limit') limit = '50') {
+    // REM-05: Validate kycTier against UserKycTier enum — reject unknown strings
+    const enumTier = kycTier && Object.values(UserKycTier).includes(kycTier as UserKycTier)
+      ? kycTier as UserKycTier
+      : undefined;
     return this.prisma.user.findMany({
-      where:   kycTier ? { kycTier: kycTier as any } : undefined,
+      where:   enumTier ? { kycTier: enumTier } : undefined,
       take:    parseInt(limit, 10),
       orderBy: { createdAt: 'desc' },
       select: {
@@ -109,30 +114,26 @@ export class AdminController {
 
   @Post('users/:id/block')
   @HttpCode(200)
-  async blockUser(@Req() req: any, @Param('id') id: string, @Body('reason') reason: string) {
-    await this.requireAdmin(req.user.sub);
+  async blockUser(@Param('id') id: string, @Body('reason') reason: string) {
     await this.prisma.user.update({ where: { id }, data: { isBlocked: true, blockReason: reason || 'Blocked by admin' } });
     return { success: true };
   }
 
   @Post('users/:id/unblock')
   @HttpCode(200)
-  async unblockUser(@Req() req: any, @Param('id') id: string) {
-    await this.requireAdmin(req.user.sub);
+  async unblockUser(@Param('id') id: string) {
     await this.prisma.user.update({ where: { id }, data: { isBlocked: false, blockReason: null } });
     return { success: true };
   }
 
   // ── Audit Logs ────────────────────────────────────────────────────────────
   @Get('audit')
-  async getAuditLogs(
-    @Req() req: any,
+  getAuditLogs(
     @Query('userId') userId?: string,
     @Query('dealId') dealId?: string,
     @Query('operation') operation?: string,
     @Query('limit') limit = '100',
   ) {
-    await this.requireAdmin(req.user.sub);
     return this.prisma.auditLog.findMany({
       where: {
         ...(userId    && { userId }),

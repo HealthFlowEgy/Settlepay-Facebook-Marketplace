@@ -128,9 +128,9 @@ export class EscrowService {
         throw new BadRequestException('Insufficient wallet balance. Please top up your wallet.');
       }
       if (err instanceof GatewayError) {
-        // HI-07 fix: Don't block thread — schedule async retry via delayed cron check
+        // HI-07 fix: Don't block thread — ScheduledTasksService polls every 5 min
         await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYMENT_ERROR } });
-        await this.scheduleRetry(dealId, 'deduction', 5000);
+        this.scheduleRetry(dealId, 'deduction');
         await this.notifications.sendDealNotification(deal, 'payment_error');
         throw new BadRequestException('Payment gateway error. Your deal has been queued for retry.');
       }
@@ -138,10 +138,21 @@ export class EscrowService {
     }
   }
 
-  // ── 3b. Retry Deduction (called by scheduler after delay) ──────────────────
+  // ── 3b. Retry Deduction (called by ScheduledTasksService) ──────────────────
   async retryEscrowDeduction(dealId: string): Promise<void> {
     const deal = await this.getDeal(dealId, true);
-    if (deal.status !== DealStatus.PAYMENT_ERROR) return; // Already resolved
+    if (deal.status !== DealStatus.PAYMENT_ERROR) return; // Already resolved elsewhere
+
+    const maxRetries = this.config.get<number>('escrow.maxRetryAttempts') ?? 3;
+    const tx = await this.prisma.escrowTransaction.findUnique({ where: { dealId }, select: { deductionAttempts: true } });
+    const attempts = tx?.deductionAttempts ?? 0;
+
+    // REM-01: Enforce retry cap — escalate to ops and leave deal in PAYMENT_ERROR for manual resolution
+    if (attempts >= maxRetries) {
+      this.logger.error(`Deal ${dealId} deduction FAILED after ${attempts} attempts — requires MANUAL RESOLUTION`);
+      await this.notifications.alertOpsTeam(dealId, `Deduction retry cap (${maxRetries}) reached — MANUAL RESOLUTION REQUIRED`);
+      return;
+    }
 
     const buyerToken  = this.getBuyerToken(deal);
     const description = `SettePay Escrow - Deal#${dealId}`;
@@ -149,23 +160,48 @@ export class EscrowService {
     try {
       await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.ESCROW_DEDUCTING } });
       const result = await this.payment.deductFromUser(buyerToken, deal.amount, description);
+
       if (result.isSuccess) {
-        const expiresAt = new Date(Date.now() + this.config.get<number>('escrow.deliveryExpiryDays') * 86_400_000);
         await this.prisma.$transaction([
-          this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.ESCROW_ACTIVE, escrowActivatedAt: new Date(), escrowExpiresAt: expiresAt } }),
+          this.prisma.deal.update({
+            where: { id: dealId },
+            data: { status: DealStatus.ESCROW_ACTIVE, escrowActivatedAt: new Date(), buyerConfirmedAt: new Date() },
+          }),
           this.prisma.escrowTransaction.upsert({
-            where: { dealId }, create: { dealId, hpDeductionRef: description, amount: deal.amount, deductedAt: new Date(), deductSuccess: true },
-            update: { deductedAt: new Date(), deductSuccess: true },
+            where:  { dealId },
+            create: { dealId, hpDeductionRef: description, amount: deal.amount, deductedAt: new Date(), deductSuccess: true, deductionAttempts: 1 },
+            update: { deductedAt: new Date(), deductSuccess: true, deductionAttempts: { increment: 1 } },
           }),
         ]);
         await this.notifications.sendDealNotification({ ...deal, status: DealStatus.ESCROW_ACTIVE }, 'escrow_active');
+        this.logger.log(`Deal ${dealId} deduction succeeded on attempt ${attempts + 1}`);
       } else {
-        await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYMENT_ERROR } });
-        await this.notifications.alertOpsTeam(dealId, 'Retry deduction failed — manual review required');
+        // Increment attempt count and leave in PAYMENT_ERROR for next scheduler cycle
+        await this.prisma.$transaction([
+          this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYMENT_ERROR } }),
+          this.prisma.escrowTransaction.upsert({
+            where:  { dealId },
+            create: { dealId, amount: deal.amount, deductionAttempts: 1 },
+            update: { deductionAttempts: { increment: 1 } },
+          }),
+        ]);
+        const newAttempts = attempts + 1;
+        if (newAttempts >= maxRetries) {
+          await this.notifications.alertOpsTeam(dealId, `Deduction retry cap (${maxRetries}) reached — MANUAL RESOLUTION REQUIRED`);
+        } else {
+          this.logger.warn(`Deal ${dealId} deduction retry ${newAttempts}/${maxRetries} failed — will retry`);
+        }
       }
     } catch (err: any) {
-      await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYMENT_ERROR } });
-      await this.notifications.alertOpsTeam(dealId, `Retry deduction exception: ${err.message}`);
+      await this.prisma.$transaction([
+        this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYMENT_ERROR } }),
+        this.prisma.escrowTransaction.upsert({
+          where:  { dealId },
+          create: { dealId, amount: deal.amount, deductionAttempts: 1 },
+          update: { deductionAttempts: { increment: 1 } },
+        }),
+      ]).catch(() => {});
+      await this.notifications.alertOpsTeam(dealId, `Deduction retry exception: ${err.message}`);
     }
   }
 
@@ -231,23 +267,33 @@ export class EscrowService {
         await this.notifications.sendDealNotification({ ...deal, status: DealStatus.SETTLED }, 'deal_settled', { netPayout, commission });
       } else {
         await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } });
-        await this.notifications.alertOpsTeam(dealId, 'payToUser failed — scheduling retry');
-        await this.scheduleRetry(dealId, 'payout', 5000);
+        this.scheduleRetry(dealId, 'payout');
       }
       return result;
     } catch (err: any) {
-      // HI-07 fix: Schedule async retry — do not block thread
+      // HI-07 fix: ScheduledTasksService will retry — do not block thread
       await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } });
-      await this.scheduleRetry(dealId, 'payout', 5000);
+      this.scheduleRetry(dealId, 'payout');
       await this.notifications.alertOpsTeam(dealId, `payToUser exception: ${err.message}`);
       throw err;
     }
   }
 
-  // ── 5b. Retry Payout ───────────────────────────────────────────────────────
+  // ── 5b. Retry Payout (called by ScheduledTasksService) ─────────────────────
   async retryPayout(dealId: string): Promise<void> {
     const deal = await this.getDeal(dealId, true);
     if (deal.status !== DealStatus.PAYOUT_FAILED) return;
+
+    const maxRetries = this.config.get<number>('escrow.maxRetryAttempts') ?? 3;
+    const tx = await this.prisma.escrowTransaction.findUnique({ where: { dealId }, select: { payoutAttempts: true } });
+    const attempts = tx?.payoutAttempts ?? 0;
+
+    // REM-01: Enforce retry cap — do not retry indefinitely; funds are safe, but ops must act
+    if (attempts >= maxRetries) {
+      this.logger.error(`Deal ${dealId} payout FAILED after ${attempts} attempts — requires MANUAL RESOLUTION`);
+      await this.notifications.alertOpsTeam(dealId, `Payout retry cap (${maxRetries}) reached — MANUAL RESOLUTION REQUIRED. Seller funds are secured.`);
+      return;
+    }
 
     const { commission, netPayout } = this.commission.calculate(deal.amount);
     const sellerToken = this.getSellerToken(deal);
@@ -256,29 +302,35 @@ export class EscrowService {
     try {
       await this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.SETTLING } });
       const result = await this.payment.payToUser(sellerToken, netPayout, description);
+
       if (result.isSuccess) {
         await this.prisma.$transaction([
           this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.SETTLED, settledAt: new Date(), commission, netPayout } }),
-          // GAP-FIX-12: Increment payoutAttempts so ops can track retry count
           this.prisma.escrowTransaction.update({
             where: { dealId },
             data: { paidOutAt: new Date(), payoutSuccess: true, payoutAttempts: { increment: 1 } },
           }),
         ]);
         await this.notifications.sendDealNotification({ ...deal, status: DealStatus.SETTLED }, 'deal_settled', { netPayout, commission });
+        this.logger.log(`Deal ${dealId} payout succeeded on attempt ${attempts + 1}`);
       } else {
         await this.prisma.$transaction([
           this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } }),
           this.prisma.escrowTransaction.update({ where: { dealId }, data: { payoutAttempts: { increment: 1 } } }),
         ]);
-        await this.notifications.alertOpsTeam(dealId, 'Retry payout failed — MANUAL RESOLUTION REQUIRED');
+        const newAttempts = attempts + 1;
+        if (newAttempts >= maxRetries) {
+          await this.notifications.alertOpsTeam(dealId, `Payout retry cap (${maxRetries}) reached — MANUAL RESOLUTION REQUIRED`);
+        } else {
+          this.logger.warn(`Deal ${dealId} payout retry ${newAttempts}/${maxRetries} failed — will retry`);
+        }
       }
     } catch (err: any) {
       await this.prisma.$transaction([
         this.prisma.deal.update({ where: { id: dealId }, data: { status: DealStatus.PAYOUT_FAILED } }),
-        this.prisma.escrowTransaction.updateMany({ where: { dealId }, data: { payoutAttempts: { increment: 1 } } }),
+        this.prisma.escrowTransaction.update({ where: { dealId }, data: { payoutAttempts: { increment: 1 } } }),
       ]).catch(() => {});
-      await this.notifications.alertOpsTeam(dealId, `Retry payout exception: ${err.message} — MANUAL RESOLUTION REQUIRED`);
+      await this.notifications.alertOpsTeam(dealId, `Payout retry exception: ${err.message} — MANUAL RESOLUTION REQUIRED`);
     }
   }
 
@@ -323,15 +375,14 @@ export class EscrowService {
     // This is intentionally non-blocking — deals proceed even if logistics API is slow
   }
 
-  /** HI-07: Schedule async retry via cron-like delayed check (DB flag) */
-  private async scheduleRetry(dealId: string, type: 'deduction' | 'payout', delayMs: number): Promise<void> {
-    const retryAt = new Date(Date.now() + delayMs);
-    this.logger.log(`Scheduling ${type} retry for deal ${dealId} at ${retryAt.toISOString()}`);
-    // Store retry intent — ScheduledTasksService polls for PAYMENT_ERROR/PAYOUT_FAILED deals
-    // This avoids blocking the current request thread (HI-07 fix)
-    await this.prisma.deal.update({
-      where: { id: dealId },
-      data: { updatedAt: new Date() }, // Touch updatedAt to trigger scheduler detection
-    }).catch(() => {});
+  /**
+   * REM-01/REM-02: scheduleRetry is intentionally a no-op here.
+   * The deal is already in PAYMENT_ERROR or PAYOUT_FAILED state after the caller updates it.
+   * ScheduledTasksService.retryFailedPayments() polls every 5 minutes for deals in those
+   * states and calls retryEscrowDeduction() / retryPayout() with full cap enforcement.
+   * No "touch" is needed — the cron picks up any deal in the error state.
+   */
+  private scheduleRetry(dealId: string, type: 'deduction' | 'payout'): void {
+    this.logger.log(`Deal ${dealId} queued for ${type} retry — ScheduledTasksService will pick it up within 5 min`);
   }
 }
